@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+pydantic
+scapy
+websockets
+pyahocorasick
+SQLAlchemy
+psycopg2-binary
+python-dotenv
+prometheus-client
+pytest
+pypcapkit
+httptools

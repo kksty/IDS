@@ -1,0 +1,45 @@
+# Local environment variables
+.env
+
+# Python virtual env
+myvenv/
+
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+
+
+# virtualenvs
+.venv/
+venv/
+myvenv/
+
+# Environment files
+.env.local
+.env.*
+
+# Node / frontend
+frontend/node_modules/
+node_modules/
+frontend/dist/
+
+# Editor / OS files
+.vscode/
+.idea/
+.DS_Store
+
+# Logs, db, builds
+*.log
+*.sqlite3
+*.db
+.pytest_cache/
+coverage/
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+.cache/
+
+# secrets
+.secrets/
+

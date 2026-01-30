@@ -1,0 +1,163 @@
+<!doctype html>
+<html>
+  <head>
+    <title>IDS 实时监控测试</title>
+  </head>
+  <body>
+    <h1>实时告警流</h1>
+    <div
+      id="log"
+      style="
+        background: #000;
+        color: #0f0;
+        padding: 20px;
+        height: 500px;
+        overflow-y: scroll;
+        font-family: monospace;
+      "
+    ></div>
+    <script>
+      const logDiv = document.getElementById("log");
+
+      function _sanitize(s, maxLen = 300) {
+        if (!s && s !== 0) return "";
+        try {
+          s = String(s);
+        } catch (e) {
+          return "";
+        }
+        // 移除控制字符，只保留可打印 ascii 和常见 unicode 空格/标点
+        s = s.replace(/[^\x20-\x7E\u00A0-\u00FF\u0100-\uFFFF]+/g, " ");
+        if (s.length > maxLen) {
+          return s.slice(0, maxLen) + "…";
+        }
+        return s;
+      }
+
+      function addEntry(data) {
+        const entry = document.createElement("div");
+        entry.style.padding = "6px 0";
+        entry.style.borderBottom = "1px solid #222";
+
+        const ts = _sanitize(data.timestamp, 40);
+        const proto = _sanitize(data.protocol, 20);
+        const summary = _sanitize(data.packet_summary, 200);
+        const src = _sanitize(data.src_ip, 64);
+        const dst = _sanitize(data.dst_ip, 64);
+        const rule = _sanitize(data.match_rule, 64) || "-";
+        const match =
+          _sanitize(data.match_text || data.payload_preview, 300) || "-";
+
+        let extras = "";
+        if (data.aggregated_count) {
+          extras = ` <strong style='color:yellow'>(aggregated x${data.aggregated_count})</strong>`;
+        }
+        entry.innerHTML = `<strong>[${ts}]</strong> ${proto} &nbsp; <em>${summary}</em><br>
+          <small>${src} → ${dst}</small><br>
+          <strong style='color:#faa'>Rule:</strong> ${rule} &nbsp;
+          <strong style='color:#afa'>Match:</strong> ${match}${extras}
+        `;
+        if (data.is_summary) {
+          entry.style.background = "#443300";
+          entry.style.color = "#ffefc2";
+          entry.style.padding = "8px";
+          entry.style.borderRadius = "4px";
+        }
+        logDiv.prepend(entry);
+      }
+
+      let ws;
+      let reconnectInterval = 1000;
+
+      function connect() {
+        const host = location.host || "localhost:8000";
+        const proto = location.protocol === "https:" ? "wss://" : "ws://";
+        ws = new WebSocket(proto + host + "/ws/alerts");
+        ws.onopen = () => {
+          reconnectInterval = 1000;
+          const info = document.createElement("p");
+          info.style.color = "white";
+          info.textContent = "已连接到 IDS 后端...";
+          logDiv.prepend(info);
+        };
+        ws.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            addEntry(data);
+          } catch (e) {
+            console.error("Invalid message", e);
+          }
+        };
+        ws.onclose = () => {
+          const warn = document.createElement("p");
+          warn.style.color = "#f88";
+          warn.textContent = "已断开连接，正在尝试重连...";
+          logDiv.prepend(warn);
+          setTimeout(() => {
+            reconnectInterval = Math.min(30000, reconnectInterval * 2);
+            connect();
+          }, reconnectInterval);
+        };
+        ws.onerror = (e) => {
+          console.error("WebSocket error", e);
+        };
+      }
+
+      connect();
+    </script>
+    <hr />
+    <h2>规则管理</h2>
+    <div>
+      <label>Rule ID: <input id="rule_id" value="R_test" /></label>
+      <label>Pattern: <input id="rule_pattern" value="password=" /></label>
+      <button id="create_rule">Create/POST</button>
+      <button id="update_rule">Update/PUT</button>
+    </div>
+    <script>
+      async function apiPostRule(id, pattern) {
+        const payload = {
+          rule_id: id,
+          pattern: pattern,
+          pattern_type: "string",
+          priority: 3,
+        };
+        const res = await fetch("/api/rules", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        return res;
+      }
+      async function apiPutRule(id, pattern) {
+        const payload = {
+          rule_id: id,
+          pattern: pattern,
+          pattern_type: "string",
+          priority: 3,
+        };
+        const res = await fetch("/api/rules/" + encodeURIComponent(id), {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        return res;
+      }
+      document
+        .getElementById("create_rule")
+        .addEventListener("click", async () => {
+          const id = document.getElementById("rule_id").value;
+          const p = document.getElementById("rule_pattern").value;
+          const r = await apiPostRule(id, p);
+          alert("POST -> " + r.status);
+        });
+      document
+        .getElementById("update_rule")
+        .addEventListener("click", async () => {
+          const id = document.getElementById("rule_id").value;
+          const p = document.getElementById("rule_pattern").value;
+          const r = await apiPutRule(id, p);
+          alert("PUT -> " + r.status);
+        });
+    </script>
+  </body>
+</html>
