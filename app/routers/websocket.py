@@ -25,21 +25,40 @@ class ConnectionManager:
         logger.info("Client disconnected. Total: %d", len(self.active_connections))
 
     async def broadcast(self, message: dict):
-        # 使用 json 序列化，并记录更详细的异常信息
-        payload = json.dumps(message, default=str)
-        clients = list(self.active_connections)  # 拷贝以便安全移除
-        logger.debug("Broadcasting to %d clients: %s", len(clients), message)
-        for connection in clients:
-            try:
-                await connection.send_text(payload)
-            except Exception as e:
-                # 记录堆栈以便排查连接或序列化问题
-                logger.exception("Failed to send message to client: %s", e)
-                # 尝试断开并从列表中移除不可用连接
-                try:
-                    self.active_connections.remove(connection)
-                except ValueError:
-                    pass
+        """广播消息到所有连接的客户端"""
+        if not self.active_connections:
+            return
+
+        # 使用 json 序列化
+        try:
+            payload = json.dumps(message, default=str)
+        except (TypeError, ValueError) as e:
+            logger.error(f"Failed to serialize message: {e}")
+            return
+
+        # 并发发送到所有客户端
+        import asyncio
+        tasks = []
+        disconnected_clients = []
+
+        for websocket in self.active_connections:
+            task = self._send_to_client(websocket, payload, disconnected_clients)
+            tasks.append(task)
+
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 清理断开的连接
+        for client in disconnected_clients:
+            self.disconnect(client)
+
+    async def _send_to_client(self, websocket: WebSocket, payload: str, disconnected_clients: list):
+        """发送消息到单个客户端"""
+        try:
+            await websocket.send_text(payload)
+        except Exception as e:
+            logger.warning(f"Failed to send message to client: {e}")
+            disconnected_clients.append(websocket)
 
 
 manager = ConnectionManager()
@@ -47,6 +66,7 @@ manager = ConnectionManager()
 
 @router.websocket("/ws/alerts")
 async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket端点用于实时告警"""
     await manager.connect(websocket)
     try:
         while True:

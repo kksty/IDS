@@ -42,7 +42,7 @@ class ProtocolParser:
             'pop3': self._parse_pop3,
             'imap': self._parse_imap,
             'telnet': self._parse_telnet,
-            'http': self._parse_http_pypcapkit if _HAVE_PCAPKIT_APP else self._parse_http_fallback,
+            'http': self._parse_http_fallback,  # Disable pypcapkit HTTP parser due to parsing errors
         }
 
     def parse_packet(self, src_ip: str, dst_ip: str, src_port: int, dst_port: int,
@@ -88,6 +88,28 @@ class ProtocolParser:
 
     def _detect_protocol(self, src_port: int, dst_port: int, protocol: str, payload: bytes) -> Optional[str]:
         """检测协议类型"""
+        # 只对TCP和UDP进行基于payload的检测，ICMP不进行应用层协议检测
+        if protocol not in ('TCP', 'UDP'):
+            # 只进行基于端口的检测
+            port_protocols = {
+                22: 'ssh',
+                21: 'ftp',
+                20: 'ftp',  # FTP数据端口
+                53: 'dns',
+                25: 'smtp',
+                587: 'smtp',  # SMTP提交
+                465: 'smtp',  # SMTPS
+                110: 'pop3',
+                995: 'pop3',  # POP3S
+                143: 'imap',
+                993: 'imap',  # IMAPS
+                23: 'telnet',
+            }
+            for port in [src_port, dst_port]:
+                if port in port_protocols:
+                    return port_protocols[port]
+            return None
+
         # 基于端口的检测
         port_protocols = {
             22: 'ssh',
@@ -109,7 +131,7 @@ class ProtocolParser:
             if port in port_protocols:
                 return port_protocols[port]
 
-        # 基于payload的检测（如果端口检测失败）
+        # 基于payload的检测（只对TCP/UDP）
         if len(payload) > 0:
             payload_str = payload[:50].decode('utf-8', errors='ignore').lower()
 

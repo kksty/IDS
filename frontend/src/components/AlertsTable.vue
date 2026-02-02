@@ -62,6 +62,11 @@
       <el-table-column prop="src_ip" label="源 IP" width="140" />
       <el-table-column prop="dst_ip" label="目的 IP" width="140" />
       <el-table-column prop="rule_id" label="Rule" width="160" />
+      <el-table-column prop="message" label="消息" width="200">
+        <template #default="{ row }">{{
+          truncateOneLine(row.message)
+        }}</template>
+      </el-table-column>
       <!-- severity column removed per request -->
       <el-table-column prop="payload_preview" label="摘要">
         <template #default="{ row }">{{
@@ -268,7 +273,7 @@ export default {
         console.warn("load alerts failed", e);
       }
       try {
-        const r2 = await fetch("/api/rules");
+        const r2 = await fetch("/api/rules/");
         if (r2.ok) {
           rules.value = await r2.json();
           rules.value.forEach((x) => (ruleMap[x.rule_id] = x));

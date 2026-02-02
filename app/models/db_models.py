@@ -34,14 +34,23 @@ class RuleModel(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
+class ConfigModel(Base):
+    __tablename__ = "config"
+
+    id = Column(Integer, primary_key=True, index=True)
+    key = Column(String(128), unique=True, index=True, nullable=False)
+    value = Column(Text, nullable=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
 class AlertModel(Base):
     __tablename__ = "alerts"
 
     id = Column(Integer, primary_key=True, index=True)
-    rule_id = Column(String(128), nullable=False)
+    rule_id = Column(String(128), index=True, nullable=False)
     match_text = Column(Text, nullable=True)
-    src_ip = Column(String(64), nullable=True)
-    dst_ip = Column(String(64), nullable=True)
+    src_ip = Column(String(64), nullable=False)
+    dst_ip = Column(String(64), nullable=False)
     pos_start = Column(Integer, nullable=True)
     pos_end = Column(Integer, nullable=True)
     payload_preview = Column(Text, nullable=True)

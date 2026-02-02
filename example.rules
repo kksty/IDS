@@ -1,0 +1,32 @@
+# 示例 Snort 3 规则文件
+# 这个文件展示了基本的 Snort 规则格式
+
+# HTTP 流量检测规则
+alert tcp any any -> any 80 (msg:"HTTP GET request"; content:"GET"; http_method; sid:1000001; rev:1;)
+
+# SSH 暴力破解检测
+alert tcp any any -> any 22 (msg:"SSH login attempt"; content:"password"; sid:1000002; rev:1;)
+
+# FTP 密码检测
+alert tcp any any -> any 21 (msg:"FTP password attempt"; content:"PASS"; sid:1000003; rev:1;)
+
+# SQL 注入检测
+alert tcp any any -> any 3306 (msg:"SQL injection attempt"; content:"UNION SELECT"; nocase; sid:1000004; rev:1;)
+
+# 高级规则示例 - 检测多个关键词
+alert tcp any any -> any any (msg:"Multiple keywords detected"; content:"password"; content:"admin"; distance:10; sid:1000005; rev:1;)
+
+# 使用正则表达式的规则
+alert tcp any any -> any any (msg:"Regex pattern match"; pcre:"/password|passwd|pwd/i"; sid:1000006; rev:1;)
+
+# 检测特定文件上传
+alert tcp any any -> any 80 (msg:"File upload detected"; content:"Content-Disposition"; content:"filename"; distance:20; sid:1000007; rev:1;)
+
+# ICMP 扫描检测
+alert icmp any any -> any any (msg:"ICMP ping sweep"; itype:8; sid:1000008; rev:1;)
+
+# UDP DNS 查询检测
+alert udp any any -> any 53 (msg:"DNS query"; content:"|01 00 00 01|"; offset:2; depth:2; sid:1000009; rev:1;)
+
+# 检测异常数据包大小
+alert tcp any any -> any any (msg:"Large TCP packet"; dsize:>1000; sid:1000010; rev:1;)

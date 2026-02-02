@@ -9,6 +9,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from threading import RLock, Thread, Event
 import time
 import json
+import ipaddress
 
 from app.services.aho import RuleEngine
 
@@ -149,6 +150,21 @@ def remove_rule(rule_id: str, rebuild: bool = True) -> bool:
     return changed
 
 
+def remove_rules(rule_ids: List[str], rebuild: bool = True) -> int:
+    """批量删除规则（通过 rule_id 列表），返回删除的规则数量，并可选异步重建引擎。"""
+    if not rule_ids:
+        return 0
+    
+    with _lock:
+        orig = len(_rules)
+        _rules[:] = [r for r in _rules if getattr(r, "rule_id", None) not in rule_ids]
+        deleted_count = orig - len(_rules)
+    
+    if deleted_count > 0 and rebuild:
+        rebuild_async()
+    return deleted_count
+
+
 def match_payload(payload: bytes, protocol: str = "", dst_port: Optional[str] = None,
                   src_ip: Optional[str] = None, src_port: Optional[str] = None,
                   dst_ip: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -182,6 +198,9 @@ def match_payload(payload: bytes, protocol: str = "", dst_port: Optional[str] = 
     for match in all_matches:
         rule_id = match.get("rule_id")
         if rule_id in candidate_rule_ids:
+            # 从规则元数据中添加消息
+            meta = eng._rule_meta.get(rule_id, {})
+            match["message"] = meta.get("description", "")
             filtered_matches.append(match)
 
     return filtered_matches
@@ -269,8 +288,8 @@ def _matches_direction(src_ip: Optional[str], src_port: Optional[str],
     if direction == "->":
         # 单向匹配：packet.src->packet.dst 必须等于 rule.src->rule.dst
         # 并且端口也要匹配
-        src_ip_match = rule_src == "any" or src_ip == rule_src
-        dst_ip_match = rule_dst == "any" or dst_ip == rule_dst
+        src_ip_match = _ip_matches(rule_src, src_ip)
+        dst_ip_match = _ip_matches(rule_dst, dst_ip)
 
         src_port_match = not rule_src_ports or (src_port and str(src_port) in [str(p) for p in rule_src_ports])
         dst_port_match = not rule_dst_ports or (dst_port and str(dst_port) in [str(p) for p in rule_dst_ports])
@@ -280,15 +299,15 @@ def _matches_direction(src_ip: Optional[str], src_port: Optional[str],
     elif direction == "<>":
         # 双向匹配：允许两个方向
         # 正向：packet.src/src_port -> packet.dst/dst_port == rule.src/src_ports -> rule.dst/dst_ports
-        forward_src_ip = rule_src == "any" or src_ip == rule_src
-        forward_dst_ip = rule_dst == "any" or dst_ip == rule_dst
+        forward_src_ip = _ip_matches(rule_src, src_ip)
+        forward_dst_ip = _ip_matches(rule_dst, dst_ip)
         forward_src_port = not rule_src_ports or (src_port and str(src_port) in [str(p) for p in rule_src_ports])
         forward_dst_port = not rule_dst_ports or (dst_port and str(dst_port) in [str(p) for p in rule_dst_ports])
         forward_match = forward_src_ip and forward_dst_ip and forward_src_port and forward_dst_port
 
         # 反向：packet.src/src_port -> packet.dst/dst_port == rule.dst/dst_ports -> rule.src/src_ports
-        reverse_src_ip = rule_dst == "any" or src_ip == rule_dst
-        reverse_dst_ip = rule_src == "any" or dst_ip == rule_src
+        reverse_src_ip = _ip_matches(rule_dst, src_ip)
+        reverse_dst_ip = _ip_matches(rule_src, dst_ip)
         reverse_src_port = not rule_dst_ports or (src_port and str(src_port) in [str(p) for p in rule_dst_ports])
         reverse_dst_port = not rule_src_ports or (dst_port and str(dst_port) in [str(p) for p in rule_src_ports])
         reverse_match = reverse_src_ip and reverse_dst_ip and reverse_src_port and reverse_dst_port
@@ -300,7 +319,7 @@ def _matches_direction(src_ip: Optional[str], src_port: Optional[str],
 
 
 def _matches_ports(src_port: Optional[str], dst_port: Optional[str], rule) -> bool:
-    """检查端口是否匹配规则"""
+    """检查端口是否匹配规则，支持否定语法"""
     rule_src_ports = getattr(rule, "src_ports", None) or []
     rule_dst_ports = getattr(rule, "dst_ports", None) or []
 
@@ -310,16 +329,77 @@ def _matches_ports(src_port: Optional[str], dst_port: Optional[str], rule) -> bo
 
     # 检查目的端口
     if rule_dst_ports:
-        dst_port_match = dst_port and str(dst_port) in [str(p) for p in rule_dst_ports]
-        if not dst_port_match:
+        if not _port_list_matches(dst_port, rule_dst_ports):
             return False
 
     # 检查源端口
     if rule_src_ports:
-        src_port_match = src_port and str(src_port) in [str(p) for p in rule_src_ports]
-        if not src_port_match:
+        if not _port_list_matches(src_port, rule_src_ports):
             return False
 
+    return True
+
+
+def _port_list_matches(packet_port: Optional[str], rule_ports: List[str]) -> bool:
+    """检查单个端口是否匹配端口规则列表，支持否定语法"""
+    if not packet_port:
+        return False
+
+    packet_port_str = str(packet_port)
+
+    # 分离普通端口和否定端口
+    normal_ports = []
+    negated_ports = []
+
+    for rule_port in rule_ports:
+        rule_port_str = str(rule_port)
+        if rule_port_str.startswith('!'):
+            negated_ports.append(rule_port_str[1:])  # 移除!前缀
+        else:
+            normal_ports.append(rule_port_str)
+
+    # 如果有普通端口，检查是否匹配任何一个普通端口
+    if normal_ports:
+        for normal_port in normal_ports:
+            if packet_port_str == normal_port:
+                return True
+        # 如果有普通端口但没有匹配，则不匹配（除非有否定端口允许）
+        if not negated_ports:
+            return False
+
+    # 检查否定端口：如果数据包端口在任何否定范围内，则不匹配
+    for negated_port in negated_ports:
+        if ':' in negated_port:
+            # 处理否定端口范围：21:23
+            try:
+                start_str, end_str = negated_port.split(':')
+                start = int(start_str)
+                end = int(end_str) if end_str else 65535
+                packet_port_num = int(packet_port_str)
+                # 如果数据包端口在这个否定范围内，则不匹配
+                if start <= packet_port_num <= end:
+                    return False
+            except (ValueError, TypeError):
+                # 如果无法解析为数字，则按字符串匹配
+                if packet_port_str == negated_port:
+                    return False
+        else:
+            # 处理单个否定端口：21
+            try:
+                negated_port_num = int(negated_port)
+                packet_port_num = int(packet_port_str)
+                # 如果数据包端口等于这个否定端口，则不匹配
+                if packet_port_num == negated_port_num:
+                    return False
+            except (ValueError, TypeError):
+                # 如果无法解析为数字，则按字符串匹配
+                if packet_port_str == negated_port:
+                    return False
+
+    # 如果只有普通端口且已经检查过（上面返回了），这里不会到达
+    # 如果有普通端口匹配，上面已经返回True
+    # 如果有否定端口且数据包端口不在否定范围内，则匹配
+    # 如果既没有普通端口也没有否定端口，则匹配（虽然这种情况不应该发生）
     return True
 
 
@@ -345,7 +425,10 @@ def load_rules_from_db():
                 pat = None
                 try:
                     val = json.loads(r.pattern)
-                    pat = val
+                    if isinstance(val, list):
+                        pat = val
+                    else:
+                        pat = str(val)
                 except Exception:
                     pat = r.pattern
 
@@ -373,6 +456,41 @@ def load_rules_from_db():
         _rebuild_engine_sync()
     finally:
         session.close()
+
+
+def _ip_matches(rule_ip: str, packet_ip: str) -> bool:
+    """检查数据包IP是否匹配规则IP，支持CIDR和否定语法"""
+    if rule_ip == "any":
+        return True
+
+    if not packet_ip:
+        return False
+
+    # 处理否定语法：!192.168.0.0/16 表示不匹配该网络
+    if rule_ip.startswith('!'):
+        negated_ip = rule_ip[1:]  # 移除!前缀
+        return not _ip_matches_single(negated_ip, packet_ip)
+    else:
+        return _ip_matches_single(rule_ip, packet_ip)
+
+
+def _ip_matches_single(rule_ip: str, packet_ip: str) -> bool:
+    """检查单个IP规则是否匹配，支持CIDR表示法"""
+    if rule_ip == "any":
+        return True
+    
+    try:
+        # 如果是CIDR表示法，如 192.168.0.0/16
+        if '/' in rule_ip:
+            network = ipaddress.ip_network(rule_ip, strict=False)
+            packet_addr = ipaddress.ip_address(packet_ip)
+            return packet_addr in network
+        else:
+            # 精确匹配单个IP
+            return rule_ip == packet_ip
+    except (ipaddress.AddressValueError, ValueError):
+        # 如果解析失败，回退到字符串匹配
+        return rule_ip == packet_ip
 
 
 __all__ = ["list_rules", "add_rule", "remove_rule", "match_payload", "rebuild_async", "load_rules_from_db"]

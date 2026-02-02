@@ -312,7 +312,7 @@ export default {
       try {
         const [sres, rres] = await Promise.all([
           fetch(`/api/alerts/stats?range=${range.value}&interval=30m`),
-          fetch(`/api/rules`),
+          fetch(`/api/rules/`),
         ]);
         const j = sres.ok ? await sres.json() : {};
         const rules = rres.ok ? await rres.json() : [];
