@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Snort3规则导入器 - 将Snort3规则转换为系统规则格式。
 """
 
@@ -147,7 +148,6 @@ class SnortRuleParser:
         'msg': re.compile(r'msg:"([^"]*)";'),
         'content': re.compile(r'content:(?:"([^"]*)"|([^;]*))(?:,([^;]+))?;', re.IGNORECASE),
         'content_hex': re.compile(r'content:([0-9a-fA-F]+);'),
-        'uricontent': re.compile(r'uricontent:(?:"([^"]*)"|([^;]*))(?:,([^;]+))?;', re.IGNORECASE),
         'pcre': re.compile(r'pcre:"([^"]*)";'),
         'sid': re.compile(r'sid:(\d+);'),
         'rev': re.compile(r'rev:(\d+);'),
@@ -157,24 +157,14 @@ class SnortRuleParser:
         'threshold': re.compile(r'threshold:\s*([^;]+);'),
         'metadata': re.compile(r'metadata:([^;]+);'),
         'reference': re.compile(r'reference:([^;]+);'),
-        'icmp_id': re.compile(r'icmp_id:(\d+);'),
-        'itype': re.compile(r'itype:(\d+);'),
-        'http_method': re.compile(r'http_method;'),
-        'http_uri': re.compile(r'http_uri;'),
-        'http_header': re.compile(r'http_header;'),
-        'http_cookie': re.compile(r'http_cookie;'),
-        'http_body': re.compile(r'http_body;'),
-        'http_stat_code': re.compile(r'http_stat_code(?::([^;]+))?;', re.IGNORECASE),
-        'http_request_line': re.compile(r'http_request_line;'),
-        'pkt_data': re.compile(r'pkt_data;'),
-        'flow': re.compile(r'flow:([^;]+);'),
+        # HTTP/content position options are not supported in the simplified model
+        'ip_proto': re.compile(r'(?:^|;)\s*ip_proto:([^;]+);'),
+        'flow': re.compile(r'(?:^|;)\s*flow:([^;]+);'),
         'flags': re.compile(r'flags:([^;]+);'),
+        'ip_id': re.compile(r'(?:^|;)\s*id:(\d+);'),
         'dsize': re.compile(r'dsize:([^;]+);'),
-        'depth': re.compile(r'depth:(\d+);'),
-        'offset': re.compile(r'offset:(\d+);'),
-        'within': re.compile(r'within:(\d+);'),
-        'distance': re.compile(r'distance:(\d+);'),
-        'nocase': re.compile(r'nocase;'),
+        # depth/offset/within/distance/nocase are not supported in the simplified model
+        'isdataat': re.compile(r'(?:^|;)\s*isdataat:([^;]+);'),
         'service': re.compile(r'service:([^;]+);'),
         'app-layer-protocol': re.compile(r'app-layer-protocol:([^;]+);'),
         'ssl_version': re.compile(r'ssl_version:([^;]+);'),
@@ -182,6 +172,7 @@ class SnortRuleParser:
         'dns_query': re.compile(r'dns_query;'),
         'smtp_command': re.compile(r'smtp_command;'),
         'pop_command': re.compile(r'pop_command;'),
+        'byte_test': re.compile(r'byte_test:([^;]+);'),
     }
 
     def parse_snort_content(self, content_str: str) -> str:
@@ -242,7 +233,7 @@ class SnortRuleParser:
         )
 
     def _parse_content_options(self, options_str: str) -> List[ContentItem]:
-        """解析content选项，支持每个content的独立修饰符"""
+        """解析content选项（简化：仅保留 content，不解析修饰符）"""
         content_items = []
         
         # 将选项字符串按分号分割，然后重新组合content相关的选项
@@ -265,49 +256,14 @@ class SnortRuleParser:
                     if content_value:
                         parsed_content = self.parse_snort_content(content_value)
                         
-                        # 解析content特定的修饰符
                         item_modifiers = {}
-                        
-                        if content_modifiers:
-                            modifier_parts = [m.strip() for m in content_modifiers.split(',') if m.strip()]
-                            for mod in modifier_parts:
-                                if mod.startswith('depth:'):
-                                    item_modifiers['depth'] = int(mod.split(':')[1])
-                                elif mod.startswith('offset:'):
-                                    item_modifiers['offset'] = int(mod.split(':')[1])
-                                elif mod.startswith('within:'):
-                                    item_modifiers['within'] = int(mod.split(':')[1])
-                                elif mod.startswith('distance '):
-                                    item_modifiers['distance'] = int(mod.split()[1])
-                                elif mod == 'nocase':
-                                    item_modifiers['nocase'] = True
-                        
-                        # 检查紧跟content的修饰符选项
                         j = i + 1
                         while j < len(options_parts):
                             next_part = options_parts[j].strip()
-                            if next_part in ['http_method', 'http_uri', 'http_header', 'http_cookie', 'http_body', 'pkt_data']:
-                                item_modifiers[next_part] = True
-                                j += 1
-                            elif next_part.startswith('distance:'):
-                                item_modifiers['distance'] = int(next_part.split(':')[1])
-                                j += 1
-                            elif next_part.startswith('within:'):
-                                item_modifiers['within'] = int(next_part.split(':')[1])
-                                j += 1
-                            elif next_part.startswith('offset:'):
-                                item_modifiers['offset'] = int(next_part.split(':')[1])
-                                j += 1
-                            elif next_part.startswith('depth:'):
-                                item_modifiers['depth'] = int(next_part.split(':')[1])
-                                j += 1
-                            elif next_part == 'nocase':
-                                item_modifiers['nocase'] = True
-                                j += 1
-                            else:
-                                # 不是content修饰符，停止检查
+                            if next_part.startswith('content:'):
                                 break
-                        
+                            j += 1
+
                         content_items.append(ContentItem(
                             content=parsed_content,
                             modifiers=item_modifiers
@@ -321,6 +277,76 @@ class SnortRuleParser:
             i += 1
         
         return content_items
+
+    def parse_byte_test(self, raw: str) -> Optional[Dict[str, Any]]:
+        """解析 byte_test 选项: byte_test:<bytes>,<op>,<value>,<offset>[,flags...]"""
+        if not raw:
+            return None
+        parts = [p.strip() for p in raw.split(',') if p.strip()]
+        if len(parts) < 4:
+            return None
+        try:
+            num_bytes = int(parts[0])
+        except Exception:
+            return None
+        op = parts[1]
+        value_str = parts[2]
+        try:
+            offset = int(parts[3])
+        except Exception:
+            return None
+
+        flags = set(p.lower() for p in parts[4:])
+        endian = 'big'
+        if 'little' in flags:
+            endian = 'little'
+        base = 10
+        if 'hex' in flags or str(value_str).lower().startswith('0x'):
+            base = 16
+        elif 'dec' in flags:
+            base = 10
+
+        try:
+            value = int(str(value_str).replace('0x', ''), base)
+        except Exception:
+            try:
+                value = int(value_str)
+            except Exception:
+                return None
+
+        return {
+            'bytes': num_bytes,
+            'op': op,
+            'value': value,
+            'offset': offset,
+            'relative': 'relative' in flags,
+            'endian': endian,
+            'raw': raw,
+        }
+
+    def parse_isdataat(self, raw: str) -> Optional[Dict[str, Any]]:
+        """解析 isdataat 选项: isdataat:!<offset>[,relative]"""
+        if not raw:
+            return None
+        parts = [p.strip() for p in str(raw).split(',') if p.strip()]
+        if not parts:
+            return None
+        first = parts[0]
+        negated = False
+        if first.startswith('!'):
+            negated = True
+            first = first[1:]
+        try:
+            offset = int(first)
+        except Exception:
+            return None
+        flags = set(p.lower() for p in parts[1:])
+        return {
+            'offset': offset,
+            'negated': negated,
+            'relative': 'relative' in flags,
+            'raw': raw,
+        }
 
     def convert_to_system_rule(self, snort_rule: SnortRule) -> Dict[str, Any]:
         """将Snort规则转换为系统规则格式"""
@@ -423,42 +449,20 @@ class SnortRuleParser:
         # 确定匹配模式和内容
         pattern = None
         pattern_type = 'string'
-        content_metadata = {}  # 存储content相关的元数据
+        byte_tests: List[Dict[str, Any]] = []
+        isdataat_list: List[Dict[str, Any]] = []
 
         if 'pcre' in snort_rule.options:
             pattern = snort_rule.options['pcre']
             pattern_type = 'pcre'
-        elif 'uricontent' in snort_rule.options:
-            # uricontent 被视为 content + http_uri
-            uricontent_data = snort_rule.options['uricontent']
-            if isinstance(uricontent_data, tuple) and len(uricontent_data) >= 1:
-                pattern = uricontent_data[0]  # uricontent的内容
-                content_metadata['http_uri'] = True  # 设置http_uri修饰符
-                # 处理其他uricontent修饰符
-                if len(uricontent_data) > 2 and uricontent_data[2]:
-                    # uricontent可能有额外的修饰符
-                    pass
-            else:
-                pattern = uricontent_data
-                content_metadata['http_uri'] = True
-            pattern_type = 'string'
         elif 'content' in snort_rule.options:
             content_data = snort_rule.options['content']
             if isinstance(content_data, list) and content_data and isinstance(content_data[0], ContentItem):
-                # 多个content项，每个有自己的修饰符
+                # 多个content项（忽略修饰符）
                 patterns = []
-                content_options = []
-                
                 for i, content_item in enumerate(content_data):
                     patterns.append(content_item.content)
-                    # 收集每个content的选项
-                    content_opts = {}
-                    for key, value in content_item.modifiers.items():
-                        content_opts[f'content_{i}_{key}'] = value
-                    content_options.append(content_opts)
-                
                 pattern = patterns
-                content_metadata['content_options'] = content_options
                 pattern_type = 'string'
             elif isinstance(content_data, list):
                 # 向后兼容：简单的content列表
@@ -468,13 +472,6 @@ class SnortRuleParser:
                 # 单个content
                 pattern = content_data
                 pattern_type = 'string'
-        elif 'http_stat_code' in snort_rule.options:
-            # http_stat_code 有值时，将值作为模式
-            stat_code_data = snort_rule.options['http_stat_code']
-            if stat_code_data:
-                pattern = stat_code_data
-                content_metadata['http_stat_code'] = True
-                pattern_type = 'string'
         elif 'content_hex' in snort_rule.options:
             # 转换十六进制内容
             hex_content = snort_rule.options['content_hex']
@@ -483,7 +480,36 @@ class SnortRuleParser:
             except:
                 pattern = hex_content
 
-        # 确定优先级
+        # 解析 byte_test
+        if 'byte_test' in snort_rule.options:
+            raw_bt = snort_rule.options['byte_test']
+            raw_list = raw_bt if isinstance(raw_bt, list) else [raw_bt]
+            for raw in raw_list:
+                bt = self.parse_byte_test(raw)
+                if bt:
+                    byte_tests.append(bt)
+
+        # 解析 isdataat
+        if 'isdataat' in snort_rule.options:
+            raw_ida = snort_rule.options['isdataat']
+            raw_list = raw_ida if isinstance(raw_ida, list) else [raw_ida]
+            for raw in raw_list:
+                ida = self.parse_isdataat(raw)
+                if ida:
+                    isdataat_list.append(ida)
+
+        # 如果没有可用的 content/pcre 等匹配项，则标记为不支持（避免在引擎中误匹配）
+        unsupported_reason = None
+        if pattern is None and not byte_tests:
+            unsupported_reason = "unsupported: no content/pcre/uricontent/http_stat_code/content_hex/byte_test"
+            pattern = "__UNSUPPORTED_SNORT_RULE__"
+            pattern_type = "snort_unsupported"
+        elif pattern is None and byte_tests:
+            # byte_test-only 规则：提供占位 pattern 以进入引擎候选
+            pattern = "__BYTE_TEST_ONLY__"
+            pattern_type = "snort_byte_test"
+
+                # 确定优先级
         priority_map = {
             'attempted-admin': 1,
             'successful-admin': 1,
@@ -542,7 +568,13 @@ class SnortRuleParser:
                 'snort_rev': snort_rule.options.get('rev'),
                 'snort_gid': snort_rule.options.get('gid'),
                 'classtype': classtype,
+                'ip_proto': snort_rule.options.get('ip_proto'),
+                'ip_id': snort_rule.options.get('ip_id'),
+                'flags': snort_rule.options.get('flags'),
                 'raw_rule': snort_rule.raw_rule,
+                'unsupported_reason': unsupported_reason,
+                'byte_tests': byte_tests,
+                'byte_test_only': True if (pattern_type == "snort_byte_test") else False,
                 # 添加高级Snort选项到metadata
                 'depth': snort_rule.options.get('depth'),
                 'offset': snort_rule.options.get('offset'),
@@ -570,11 +602,9 @@ class SnortRuleParser:
                 'threshold': snort_rule.options.get('threshold'),
                 'metadata': snort_rule.options.get('metadata'),
                 'reference': snort_rule.options.get('reference'),
-                'icmp_id': snort_rule.options.get('icmp_id'),
-                'itype': snort_rule.options.get('itype'),
-                **content_metadata  # 合并content相关的元数据
+                'isdataat': isdataat_list,
             },
-            'enabled': True
+            'enabled': False if unsupported_reason else True
         }
 
 

@@ -54,4 +54,17 @@ class AlertModel(Base):
     pos_start = Column(Integer, nullable=True)
     pos_end = Column(Integer, nullable=True)
     payload_preview = Column(Text, nullable=True)
+    priority = Column(Integer, nullable=True)
+    severity = Column(String(16), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class SuspectedAttackerModel(Base):
+    __tablename__ = "suspected_attackers"
+
+    id = Column(Integer, primary_key=True, index=True)
+    src_ip = Column(String(64), unique=True, index=True, nullable=False)
+    severity = Column(String(32), nullable=True)
+    first_seen = Column(DateTime(timezone=True), nullable=True)
+    description = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

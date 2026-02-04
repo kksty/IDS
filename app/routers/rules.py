@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from fastapi import APIRouter, HTTPException, UploadFile, File
 from typing import List, Any
 from sqlalchemy.exc import SQLAlchemyError

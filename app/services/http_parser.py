@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 from typing import List, Tuple, Dict, Any
@@ -10,84 +11,87 @@ try:
 except Exception:
     _HAVE_HTTPT = False
 
+# pcapkit 不用于 HTTP 解析：它的应用层自动解析在遇到半包/非 HTTP 数据时容易产生噪声报错。
+# HTTP 解析统一由 httptools（若可用）完成。
 _HAVE_PCAPKIT = False
-try:
-    import pcapkit  # type: ignore
-    _HAVE_PCAPKIT = True
-except Exception:
-    _HAVE_PCAPKIT = False
 
 
 class HttpRequestParser:
+    """httptools 的回调接收器。
+
+    说明：httptools 通过回调提供 method/url/headers/body 等字段。
+    这里把一次 message 的数据收集为 dict 并 append 到 requests。
+    """
+
     def __init__(self):
         self.requests: List[Dict[str, Any]] = []
-        self.headers = {}
-        self.method = ""
-        self.path = ""
-        self.version = ""
-        self.body_buffer = bytearray()
-        self.parser = None
+        self._reset_message()
 
-    def on_method(self, method: bytes):
-        pass  # httptools doesn't call this
+    def _reset_message(self) -> None:
+        self.headers: Dict[str, str] = {}
+        self.method: str = ""
+        self.path: str = ""
+        self.version: str = ""
+        self.body_buffer = bytearray()
+
+    def on_message_begin(self):
+        self._reset_message()
 
     def on_url(self, url: bytes):
-        pass  # httptools doesn't call this
+        try:
+            self.path = url.decode("utf-8", errors="ignore")
+        except Exception:
+            self.path = ""
 
     def on_header(self, name: bytes, value: bytes):
-        pass  # httptools doesn't call this
+        try:
+            k = name.decode("utf-8", errors="ignore").strip().lower()
+            v = value.decode("utf-8", errors="ignore").strip()
+            if k:
+                self.headers[k] = v
+        except Exception:
+            pass
 
     def on_headers_complete(self):
-        pass
+        # method / version 需要从 parser 对象上取，extract_http_requests_httptools 里会注入 self._parser
+        try:
+            self.method = self._parser.get_method().decode("utf-8", errors="ignore")  # type: ignore[attr-defined]
+        except Exception:
+            self.method = ""
+        try:
+            self.version = f"HTTP/{self._parser.get_http_version()}"  # type: ignore[attr-defined]
+        except Exception:
+            self.version = ""
 
     def on_body(self, body: bytes):
         self.body_buffer.extend(body)
 
     def on_message_complete(self):
-        # Get data from parser
-        self.method = self.parser.get_method().decode("utf-8", errors="ignore")
-        self.path = self.parser.get_url().decode("utf-8", errors="ignore")
-        self.version = f"HTTP/{self.parser.get_http_version()}"
-        self.headers = {k.decode("utf-8", errors="ignore"): v.decode("utf-8", errors="ignore") for k, v in self.parser.get_headers()}
-
         body = bytes(self.body_buffer)
-        
-        # Check if body is complete
-        content_length = 0
-        if "content-length" in self.headers:
-            try:
-                content_length = int(self.headers["content-length"])
-            except Exception:
-                content_length = 0
-        
-        if len(body) < content_length:
-            # Body incomplete, don't add request
-            return
-        
-        # Decode if needed
+
+        # 解压（尽量而为；失败就返回原始 body）
         try:
-            ce = self.headers.get("content-encoding", "").lower()
+            ce = (self.headers.get("content-encoding") or "").lower()
             if "gzip" in ce or "deflate" in ce:
                 body = _decode_gzip(body)
         except Exception:
             pass
 
-        raw = f"{self.method} {self.path} {self.version}\r\n".encode() + b"\r\n".join([f"{k}: {v}".encode() for k, v in self.headers.items()]) + b"\r\n\r\n" + body
+        # 生成 raw（用于去重/展示；不追求完全还原）
+        try:
+            header_lines = [f"{k}: {v}".encode() for k, v in self.headers.items()]
+            raw = f"{self.method} {self.path} {self.version}\r\n".encode() + b"\r\n".join(header_lines) + b"\r\n\r\n" + body
+        except Exception:
+            raw = body
 
         self.requests.append({
             "method": self.method,
             "path": self.path,
             "version": self.version,
-            "headers": self.headers,
+            "headers": dict(self.headers),
             "body": body,
             "raw": raw,
         })
-        # Reset for next request
-        self.headers = {}
-        self.method = ""
-        self.path = ""
-        self.version = ""
-        self.body_buffer = bytearray()
 
 
 def extract_http_requests(buf: bytes) -> Tuple[List[Dict[str, Any]], int]:
@@ -99,19 +103,30 @@ def extract_http_requests(buf: bytes) -> Tuple[List[Dict[str, Any]], int]:
 
 
 def _extract_http_requests_httptools(buf: bytes) -> Tuple[List[Dict[str, Any]], int]:
-    """Extract HTTP requests using httptools."""
+    """Extract HTTP requests using httptools.
+
+    注意：httptools 适用于“连续的 HTTP 字节流”。TCP 半包/乱序需要上层先重组。
+
+    consumed 的语义：为了保持现有调用方式，这里仍然返回“消费了多少输入字节”。
+    httptools 不直接暴露精确消费位置，因此：
+    - 如果解析出至少一个完整 request，则认为本次 buf 都可消费（上层按现有逻辑清理 buffer）
+    - 如果没有完整 request，则返回 0（让上层继续累积）
+    """
     parser_obj = HttpRequestParser()
     parser = httptools.HttpRequestParser(parser_obj)
-    parser_obj.parser = parser  # Set reference for callbacks
+    # 注入 parser 引用供回调取 method/version
+    parser_obj._parser = parser  # type: ignore[attr-defined]
+
     try:
         parser.feed_data(buf)
-        # If no requests were parsed (e.g., incomplete body), return 0 consumed
-        if not parser_obj.requests:
-            return [], 0
-        return parser_obj.requests, len(buf)  # Assume all data consumed for simplicity
     except Exception:
-        # If httptools fails, fallback
+        # httptools 在遇到非 HTTP 或明显损坏数据时可能抛异常；回退到 fallback
         return _extract_http_requests_fallback(buf)
+
+    if not parser_obj.requests:
+        return [], 0
+
+    return parser_obj.requests, len(buf)
 
 
 def _extract_http_requests_fallback(buf: bytes) -> Tuple[List[Dict[str, Any]], int]:

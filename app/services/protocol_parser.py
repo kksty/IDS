@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 协议解析器模块
 为不同协议提供专门的解析功能，包括SSH、FTP、DNS等
@@ -42,7 +43,7 @@ class ProtocolParser:
             'pop3': self._parse_pop3,
             'imap': self._parse_imap,
             'telnet': self._parse_telnet,
-            'http': self._parse_http_fallback,  # Disable pypcapkit HTTP parser due to parsing errors
+            'http': self._parse_http_pypcapkit if _HAVE_PCAPKIT_APP else self._parse_http_fallback,  # Use pypcapkit with improved error handling
         }
 
     def parse_packet(self, src_ip: str, dst_ip: str, src_port: int, dst_port: int,
@@ -241,37 +242,83 @@ class ProtocolParser:
         }
 
         try:
+            # 首先检查payload是否可能是HTTP数据
+            if not payload or len(payload) < 10:
+                data['errors'].append("Payload too short for HTTP parsing")
+                return self._parse_http_fallback(payload, src_port, dst_port)
+
+            # 检查是否以HTTP方法或HTTP/开头
+            payload_str = payload[:50].decode('utf-8', errors='ignore').strip()
+            if not (payload_str.upper().startswith(('GET ', 'POST ', 'PUT ', 'DELETE ', 'HEAD ', 'OPTIONS ', 'PATCH ')) or
+                    'HTTP/' in payload_str.upper()):
+                data['errors'].append("Payload does not appear to be HTTP")
+                return self._parse_http_fallback(payload, src_port, dst_port)
+
+            # 尝试使用pcapkit解析
             http_parser = PcapHTTP(payload)
             info = http_parser.info
 
             # 解析HTTP信息
-            if hasattr(info, 'receipt'):
+            if hasattr(info, 'receipt') and info.receipt:
                 receipt = info.receipt
+                # 手动解析method（pcapkit有时解析不完整）
                 if hasattr(receipt, 'method'):
-                    data['method'] = receipt.method
-                if hasattr(receipt, 'uri'):
-                    data['uri'] = receipt.uri
-                if hasattr(receipt, 'version'):
+                    method = str(receipt.method).strip()
+                    if not method:
+                        # 从原始payload提取method
+                        try:
+                            payload_start = payload.decode('utf-8', errors='ignore').strip()
+                            if payload_start:
+                                first_line = payload_start.split('\n')[0]
+                                method_part = first_line.split()[0] if ' ' in first_line else None
+                                if method_part and method_part.isalpha():
+                                    method = method_part.upper()
+                        except:
+                            pass
+                    data['method'] = method if method else None
+                else:
+                    # 从原始payload提取method
+                    try:
+                        payload_start = payload.decode('utf-8', errors='ignore').strip()
+                        if payload_start:
+                            first_line = payload_start.split('\n')[0]
+                            method_part = first_line.split()[0] if ' ' in first_line else None
+                            if method_part and method_part.isalpha():
+                                data['method'] = method_part.upper()
+                    except:
+                        pass
+
+                if hasattr(receipt, 'uri') and receipt.uri:
+                    data['uri'] = str(receipt.uri)
+                if hasattr(receipt, 'version') and receipt.version:
                     data['version'] = str(receipt.version)
 
-            # 如果是响应
-            if hasattr(info, 'receipt') and hasattr(info.receipt, 'status'):
-                data['status_code'] = info.receipt.status
-                data['status_text'] = getattr(info.receipt, 'text', None)
+                # 如果是响应
+                if hasattr(receipt, 'status') and receipt.status:
+                    data['status_code'] = receipt.status
+                    data['status_text'] = getattr(receipt, 'text', '')
 
             # 解析头部
-            if hasattr(info, 'header'):
+            if hasattr(info, 'header') and info.header:
                 headers = {}
-                for key, value in info.header.items():
-                    headers[str(key)] = str(value)
-                data['headers'] = headers
+                try:
+                    for key, value in info.header.items():
+                        headers[str(key)] = str(value)
+                    data['headers'] = headers
+                except Exception as header_e:
+                    data['errors'].append(f"Header parsing failed: {header_e}")
 
             # 解析body
             if hasattr(info, 'body') and info.body:
-                data['body'] = info.body
+                try:
+                    data['body'] = info.body if isinstance(info.body, bytes) else str(info.body).encode('utf-8')
+                except Exception as body_e:
+                    data['errors'].append(f"Body parsing failed: {body_e}")
 
         except Exception as e:
-            data['errors'].append(f"pypcapkit HTTP parsing failed: {e}")
+            error_msg = f"pypcapkit HTTP parsing failed: {type(e).__name__}: {e}"
+            data['errors'].append(error_msg)
+            logger.debug(f"pcapkit HTTP parsing error for payload length {len(payload)}: {error_msg}")
             # 回退到自定义解析
             return self._parse_http_fallback(payload, src_port, dst_port)
 

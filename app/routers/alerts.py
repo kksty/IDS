@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from fastapi import APIRouter, Query
 from typing import List, Optional
 from datetime import datetime, timedelta, timezone
@@ -10,10 +11,39 @@ router = APIRouter(prefix="/api/alerts", tags=["Alerts"])
 
 
 @router.get("/", response_model=List[dict])
-async def recent_alerts(limit: int = 50):
+async def recent_alerts(
+    limit: int = 50,
+    src_ip: Optional[str] = None,
+    rule_id: Optional[str] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+):
+    """支持简单筛选的告警查询：按 src_ip / rule_id / 时间范围 / limit 返回最近告警。
+
+    时间参数使用 ISO 8601 字符串（例如 2024-01-01T00:00:00Z）
+    """
     session = SessionLocal()
     try:
-        rows = session.query(AlertModel).order_by(AlertModel.created_at.desc()).limit(limit).all()
+        q = session.query(AlertModel)
+        if src_ip:
+            q = q.filter(AlertModel.src_ip == src_ip)
+        if rule_id:
+            q = q.filter(AlertModel.rule_id == rule_id)
+        # 时间过滤
+        if start:
+            try:
+                dt_start = datetime.fromisoformat(start)
+                q = q.filter(AlertModel.created_at >= dt_start)
+            except Exception:
+                pass
+        if end:
+            try:
+                dt_end = datetime.fromisoformat(end)
+                q = q.filter(AlertModel.created_at <= dt_end)
+            except Exception:
+                pass
+
+        rows = q.order_by(AlertModel.created_at.desc()).limit(limit).all()
         out = []
         for r in rows:
             out.append({
@@ -25,6 +55,8 @@ async def recent_alerts(limit: int = 50):
                 "pos_start": r.pos_start,
                 "pos_end": r.pos_end,
                 "payload_preview": r.payload_preview,
+                "priority": r.priority,
+                "severity": r.severity,
                 "created_at": r.created_at.isoformat() if r.created_at is not None else None,
             })
         return out
@@ -81,9 +113,9 @@ async def alerts_stats(
         if interval == "30m":
             # Use raw SQL to compute bucket: date_trunc('hour', created_at) + floor(date_part('minute', created_at)/30) * interval '30 minutes'
             sql = text(
-                "SELECT bucket, SUM(CASE WHEN r.priority <= 1 THEN 1 ELSE 0 END) AS high, "
+                "SELECT bucket, SUM(CASE WHEN r.priority IS NOT NULL AND r.priority <= 1 THEN 1 ELSE 0 END) AS high, "
                 "SUM(CASE WHEN r.priority = 2 THEN 1 ELSE 0 END) AS medium, "
-                "SUM(CASE WHEN r.priority >= 3 THEN 1 ELSE 0 END) AS low, COUNT(*) AS total FROM ("
+                "SUM(CASE WHEN r.priority IS NULL OR r.priority >= 3 THEN 1 ELSE 0 END) AS low, COUNT(*) AS total FROM ("
                 "  SELECT *, (date_trunc('hour', created_at) + floor(date_part('minute', created_at)/30)::int * interval '30 minutes') AS bucket "
                 "  FROM alerts "
                 "  WHERE (:start IS NULL OR created_at >= :start)"
@@ -120,12 +152,17 @@ async def alerts_stats(
 
             buckets = []
             for row in q.all():
+                high = int(row.high)
+                medium = int(row.medium)
+                total_row = int(row.total)
+                # Alerts with no matching rule (NULL priority) go into low so high+medium+low=total
+                low = max(0, total_row - high - medium)
                 buckets.append({
                     "bucket": row.bucket.isoformat() if row.bucket is not None else None,
-                    "high": int(row.high),
-                    "medium": int(row.medium),
-                    "low": int(row.low),
-                    "total": int(row.total),
+                    "high": high,
+                    "medium": medium,
+                    "low": low,
+                    "total": total_row,
                 })
 
         # top rules
@@ -157,17 +194,13 @@ async def clear_all_alerts():
     """清空所有告警记录"""
     session = SessionLocal()
     try:
-        # 获取删除前的数量
         count_before = session.query(AlertModel).count()
-        
-        # 删除所有告警
         session.query(AlertModel).delete()
         session.commit()
-        
         return {
-            "status": "cleared", 
+            "status": "cleared",
             "deleted_count": count_before,
-            "message": f"成功清空了 {count_before} 条告警记录"
+            "message": f"成功清空了 {count_before} 条告警记录",
         }
     except Exception as e:
         session.rollback()
@@ -178,36 +211,15 @@ async def clear_all_alerts():
 
 @router.delete("/{alert_id}")
 async def delete_alert(alert_id: int):
-        """删除指定 ID 的告警记录。"""
-        session = SessionLocal()
-        try:
-            row = session.query(AlertModel).filter(AlertModel.id == alert_id).first()
-            if not row:
-                return {"status": "not_found", "id": alert_id}
-            session.delete(row)
-            session.commit()
-            return {"status": "deleted", "id": alert_id}
-        finally:
-            session.close()
-
-
-@router.delete("/")
-async def clear_all_alerts():
-    """清空所有告警记录"""
+    """删除指定 ID 的告警记录。"""
     session = SessionLocal()
     try:
-        # 获取删除前的数量
-        count_before = session.query(AlertModel).count()
-
-        # 删除所有记录
-        session.query(AlertModel).delete()
+        row = session.query(AlertModel).filter(AlertModel.id == alert_id).first()
+        if not row:
+            return {"status": "not_found", "id": alert_id}
+        session.delete(row)
         session.commit()
-
-        return {
-            "status": "cleared",
-            "deleted_count": count_before,
-            "message": f"成功清空了 {count_before} 条告警记录"
-        }
+        return {"status": "deleted", "id": alert_id}
     finally:
         session.close()
 

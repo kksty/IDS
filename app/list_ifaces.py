@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # 创建一个临时脚本 list_ifaces.py
 from scapy.all import get_if_list, conf
 

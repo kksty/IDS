@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Aho-Corasick 多模式匹配实现（仅依赖 pyahocorasick）。
 
 此模块强制要求 `pyahocorasick` 安装；若未安装会立刻抛出 ImportError，避免在运行时退回到性能较差的 Python 实现。
@@ -57,7 +58,7 @@ class RuleEngine:
         """加载规则集合（可迭代）。期望每个 rule 至少包含 `rule_id`, `pattern`, `pattern_type`。"""
         # 存储模式到规则的映射：pattern -> [rule_ids]
         self._pattern_to_rules: Dict[str, List[str]] = {}
-        self._rules_with_options: List[Any] = []  # 存储带有高级选项的规则
+        self._rules_with_options: List[Any] = []  # 已废弃：保留占位
         added_patterns = set()  # 跟踪已添加的模式
 
         for r in rules:
@@ -83,21 +84,15 @@ class RuleEngine:
             if not enabled or rid is None or pattern is None:
                 continue
 
-            self._rule_meta[rid] = {"priority": priority, "action": action, "description": getattr(r, "description", "")}
-
-            # 检查是否有高级选项
-            has_advanced_options = (
-                metadata.get('depth') is not None or
-                metadata.get('offset') is not None or
-                metadata.get('within') is not None or
-                metadata.get('distance') is not None or
-                metadata.get('nocase') is True
-            )
-
-            if has_advanced_options:
-                # 带有高级选项的规则，存储起来单独处理
-                self._rules_with_options.append(r)
-                continue
+            self._rule_meta[rid] = {
+                "priority": priority,
+                "action": action,
+                "description": getattr(r, "description", ""),
+                "metadata": metadata,
+                "byte_tests": metadata.get("byte_tests") if isinstance(metadata, dict) else None,
+                "byte_test_only": metadata.get("byte_test_only") if isinstance(metadata, dict) else False,
+                "ip_proto": metadata.get("ip_proto") if isinstance(metadata, dict) else None,
+            }
 
             if pattern_type == "string":
                 # 获取模式列表
@@ -162,31 +157,6 @@ class RuleEngine:
                     if m:
                         results.append({"rule_id": rid, "match": m.group(0), "pos": m.span(), "type": "pcre"})
                         break
-
-        # 检查带有高级选项的规则
-        for rule in self._rules_with_options:
-            if isinstance(rule, dict):
-                rule_obj = None
-                # 如果是字典格式，尝试创建Rule对象进行匹配
-                try:
-                    from ..models.rule import Rule
-                    rule_obj = Rule(**rule)
-                except:
-                    continue
-            else:
-                rule_obj = rule
-
-            if rule_obj and rule_obj.matches_payload(payload):
-                # 获取匹配的模式
-                pattern = rule_obj.pattern
-                if isinstance(pattern, list):
-                    pattern = pattern[0] if pattern else ""
-                results.append({
-                    "rule_id": rule_obj.rule_id, 
-                    "match": pattern, 
-                    "pos": (0, len(payload)),  # 高级选项匹配不提供精确位置
-                    "type": "string_advanced"
-                })
 
         return results
 

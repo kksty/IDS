@@ -1,14 +1,19 @@
+# -*- coding: utf-8 -*-
 import datetime
 import asyncio
+import logging
+import threading
+import time
 from typing import Optional, Callable, Coroutine, Any
+
 from scapy.all import sniff
 from scapy.layers.inet import IP, TCP, UDP, ICMP
-import logging
+from scapy.utils import PcapReader
 
 from app.services.detection import ContextManager
 from app.services.http_parser import extract_http_requests
 from app.services.reassembly_adapter import FlowReassemblerManager
-from app.services.behavior_analyzer import BehaviorAnalyzer
+from app.services.behavior_analyzer import BehaviorAnalyzer, BehaviorAlert
 from app.services.protocol_parser import parse_packet_for_protocol
 
 logger = logging.getLogger("ids.sniffer")
@@ -17,7 +22,7 @@ logger = logging.getLogger("ids.sniffer")
 class SnifferManager:
     """网络嗅探管理器，封装所有嗅探相关组件"""
 
-    def __init__(self, context_timeout: float = None, max_buffer: int = None):
+    def __init__(self, context_timeout: Optional[float] = None, max_buffer: Optional[int] = None):
         # 使用配置中的默认值
         if context_timeout is None:
             from app.config import config
@@ -25,15 +30,238 @@ class SnifferManager:
         if max_buffer is None:
             from app.config import config
             max_buffer = config.MAX_BUFFER_SIZE
-            
+
         self.context_manager = ContextManager(timeout=context_timeout)
         self.reassembly_manager = FlowReassemblerManager(max_buffer=max_buffer)
         self.behavior_analyzer = BehaviorAnalyzer()
 
-    def process_packet(self, packet, broadcast_callable: Callable[[dict], Coroutine[Any, Any, Any]]):
-        """处理单个数据包"""
-        # 复用原有的包处理逻辑，但使用实例变量而不是全局变量
-        return self._process_packet_impl(packet, broadcast_callable)
+        # TCP flow state for flow keyword matching
+        self._tcp_flow_states = {}
+        self._tcp_flow_lock = threading.RLock()
+
+        # 将行为分析告警接入统一告警链路（DB 持久化 + WebSocket 广播）
+        # 实际写库/广播由 Alerter 的后台线程完成，不阻塞嗅探线程。
+        self.behavior_analyzer.add_alert_callback(self._handle_behavior_alert)
+
+        # 由外部在启动时注入的事件循环，用于 WebSocket 广播等异步操作
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
+        
+        # 停止控制
+        self._stop_event = threading.Event()
+        self._sniffing_active = False
+
+    def set_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """设置事件循环引用，供内部告警广播使用。"""
+        self.loop = loop
+
+    def stop(self) -> None:
+        """停止嗅探管理器"""
+        self._stop_event.set()
+        self._sniffing_active = False
+        logger.info("SnifferManager stopped")
+
+    def is_active(self) -> bool:
+        """检查是否正在活动"""
+        return self._sniffing_active and not self._stop_event.is_set()
+
+    def process_packet(self, packet, broadcast_callable: Callable[[dict], Coroutine[Any, Any, Any]]) -> None:
+        """对外暴露的数据包处理入口（供 scapy 回调使用）。"""
+        # 检查是否应该停止
+        if self._stop_event.is_set():
+            return
+            
+        # 保存 broadcast_callable，供行为告警 callback 使用
+        try:
+            self._broadcast_callable = broadcast_callable
+        except Exception:
+            pass
+
+        try:
+            self._process_packet_impl(packet, broadcast_callable)
+        except Exception:
+            # 确保单个数据包异常不会中断嗅探线程
+            logger.exception("Failed to process packet")
+
+    def _is_likely_http_payload(self, payload: bytes) -> bool:
+        """快速检测payload是否可能是HTTP流量"""
+        if not payload or len(payload) < 10:
+            return False
+
+        # 检查前50个字节
+        payload_str = payload[:50].decode('utf-8', errors='ignore').strip()
+
+        # HTTP请求方法
+        if payload_str.upper().startswith(('GET ', 'POST ', 'PUT ', 'DELETE ', 'HEAD ', 'OPTIONS ', 'PATCH ', 'CONNECT ', 'TRACE ')):
+            return True
+
+        # HTTP响应
+        if payload_str.upper().startswith('HTTP/'):
+            return True
+
+        # 检查是否包含HTTP头部特征
+        if any(header in payload_str.lower() for header in ['host:', 'user-agent:', 'content-type:', 'accept:', 'cookie:']):
+            return True
+
+        return False
+
+    def _flow_key(self, src_ip: str, src_port: Any, dst_ip: str, dst_port: Any) -> str:
+        """生成与方向无关的 flow key（TCP only）。"""
+        left = f"{src_ip}:{src_port}"
+        right = f"{dst_ip}:{dst_port}"
+        if left <= right:
+            return f"{left}<->{right}"
+        return f"{right}<->{left}"
+
+    def _parse_tcp_flags(self, flags: Any) -> set:
+        """将 Scapy flags 转为集合，如 {"S","A"}。"""
+        if flags is None:
+            return set()
+        try:
+            s = str(flags)
+        except Exception:
+            return set()
+        return {ch.upper() for ch in s if ch.isalpha()}
+
+    def _update_tcp_flow_state(self, packet, src_ip: str, dst_ip: str, sport: Any, dport: Any, packet_info: dict) -> None:
+        """基于 TCP 三次握手推断 client/server 与 established 状态。"""
+        try:
+            flags = self._parse_tcp_flags(getattr(packet[TCP], "flags", None))
+        except Exception:
+            flags = set()
+
+        key = self._flow_key(src_ip, sport, dst_ip, dport)
+        now = time.time()
+
+        with self._tcp_flow_lock:
+            # 清理过期 flow
+            if len(self._tcp_flow_states) > 5000:
+                expired = [
+                    k
+                    for k, v in self._tcp_flow_states.items()
+                    if now - v.get("last_seen", now) > 180
+                ]
+                for k in expired:
+                    self._tcp_flow_states.pop(k, None)
+
+            st = self._tcp_flow_states.get(key)
+            if st is None:
+                st = {
+                    "client": None,
+                    "server": None,
+                    "established": False,
+                    "last_seen": now,
+                }
+                self._tcp_flow_states[key] = st
+            else:
+                st["last_seen"] = now
+
+            # SYN (no ACK) -> client->server
+            if "S" in flags and "A" not in flags:
+                st["client"] = (src_ip, str(sport))
+                st["server"] = (dst_ip, str(dport))
+                st["established"] = False
+
+            # SYN+ACK -> server->client, mark established
+            if "S" in flags and "A" in flags:
+                if st.get("client") is None:
+                    st["client"] = (dst_ip, str(dport))
+                if st.get("server") is None:
+                    st["server"] = (src_ip, str(sport))
+                st["established"] = True
+
+            # Any ACK after we have roles indicates established
+            if "A" in flags and st.get("client") and st.get("server"):
+                st["established"] = True
+
+            # compute flow direction
+            flow_dir = None
+            if st.get("client") and st.get("server"):
+                c_ip, c_port = st["client"]
+                s_ip, s_port = st["server"]
+                if (src_ip, str(sport)) == (c_ip, c_port) and (dst_ip, str(dport)) == (s_ip, s_port):
+                    flow_dir = "to_server"
+                elif (src_ip, str(sport)) == (s_ip, s_port) and (dst_ip, str(dport)) == (c_ip, c_port):
+                    flow_dir = "to_client"
+
+            packet_info["flow_established"] = bool(st.get("established"))
+            packet_info["flow_dir"] = flow_dir
+
+    def _track_auth_event(self, src_ip: str, dst_ip: str, success: bool, auth_type: str) -> None:
+        """向行为分析模块提交认证事件（成功/失败）。"""
+        try:
+            self.behavior_analyzer.process_event({
+                "type": "auth",
+                "src_ip": src_ip,
+                "dst_ip": dst_ip,
+                "success": success,
+                "auth_type": auth_type,
+            })
+        except Exception:
+            logger.exception("Failed to track auth event")
+
+    def _handle_behavior_alert(self, alert: BehaviorAlert) -> None:
+        """把行为分析模块产生的告警转成系统统一告警格式并交给 Alerter。"""
+        try:
+            from app.services.alerter import get_alerter
+
+            sev = (getattr(alert, "severity", "") or "").lower()
+            priority = 3
+            if sev == "high":
+                priority = 1
+            elif sev == "medium":
+                priority = 2
+
+            rule_id = f"behavior:{getattr(alert, 'alert_type', 'unknown')}"
+            packet_summary = f"Behavior {getattr(alert, 'alert_type', 'unknown')} from {getattr(alert, 'src_ip', '')}"
+
+            payload_preview = getattr(alert, "description", "") or ""
+            try:
+                details = getattr(alert, "details", None)
+                if isinstance(details, dict) and details:
+                    import json
+                    details_str = json.dumps(details, ensure_ascii=False, default=str)
+                    if details_str:
+                        payload_preview = f"{payload_preview} | {details_str}"
+            except Exception:
+                pass
+
+            details = getattr(alert, "details", {}) if isinstance(getattr(alert, "details", {}), dict) else {}
+
+            alert_data = {
+                "timestamp": datetime.datetime.fromtimestamp(getattr(alert, "timestamp", time.time())).strftime("%H:%M:%S"),
+                "protocol": "BEHAVIOR",
+                "src_ip": getattr(alert, "src_ip", "") or "",
+                "dst_ip": str(details.get("target_ip") or "") if isinstance(details, dict) else "",
+                "packet_summary": packet_summary,
+                "match_rule": rule_id,
+                "match_text": getattr(alert, "description", "") or "",
+                "match_type": "behavior",
+                "payload_preview": payload_preview,
+                "pos_start": None,
+                "pos_end": None,
+                # 附加字段（websocket 直接展示可用；DB 当前不存）
+                "severity": sev,
+                "priority": priority,
+            }
+
+            # 复用当前 sniffer 的 broadcast_callable（由 start_sniffing/process_pcap 传入），
+            # 这样行为告警也能正常走 WebSocket 广播。
+            alerter = get_alerter(getattr(self, "_broadcast_callable", None), self.loop)
+            alerter.handle_alert(alert_data)
+        except Exception:
+            logger.exception("Failed to handle behavior alert")
+
+    def _priority_to_severity(self, priority: Any) -> str:
+        """将规则优先级映射为严重度：1=high, 2=medium, 3=low。"""
+        try:
+            pr = int(priority)
+            if pr <= 1:
+                return "high"
+            if pr == 2:
+                return "medium"
+            return "low"
+        except Exception:
+            return "low"
 
     def _process_packet_impl(self, packet, broadcast_callable: Callable[[dict], Coroutine[Any, Any, Any]]):
         """实际的数据包处理实现"""
@@ -44,6 +272,7 @@ class SnifferManager:
             return  # Skip non-IP packets
         
         ip_layer = packet[IP]
+        ip_proto = getattr(ip_layer, "proto", None)
         proto = ""  # Initialize proto variable
 
         try:
@@ -75,114 +304,200 @@ class SnifferManager:
             except Exception:
                 payload = b""
 
-        # Try to parse with pypcapkit for more accurate information
-        if _HAVE_PCAPKIT:
+        # 解析层策略：
+        # - scapy 负责抓包与原始 payload 提取（稳定，且不会误触发应用层解析）
+        # - pcapkit（若启用）仅用于 L3/L4 字段标准化，不做应用层解析
+        #   为避免 pcapkit 在解析半包/非 HTTP 数据时深入到 HTTPv1 造成噪声，这里只使用 scapy 的解析结果。
+        src_ip = ip_layer.src
+        dst_ip = ip_layer.dst
+        
+        sport = getattr(packet, "sport", "")
+        dport = getattr(packet, "dport", "")
+
+        packet_info = {
+            "ip_id": getattr(ip_layer, "id", None),
+            "ip_proto": ip_proto,
+            "flags": None,
+            "seq": None,
+            "ack": None,
+            "window": None,
+            "icmp_type": None,
+            "icmp_code": None,
+        }
+
+        # 如果 pypcapkit 未能识别协议或未启用，回退到 scapy 基于协议层的判定
+        if not proto:
             try:
-                # Use IP layer bytes instead of full packet bytes
-                ip_bytes = bytes(ip_layer)
-                pcap_ip = IPv4(ip_bytes)
-                src_ip = str(pcap_ip.src)
-                dst_ip = str(pcap_ip.dst)
-
-                if isinstance(pcap_ip.payload, PcapTCP):
+                if packet.haslayer(TCP):
                     proto = "TCP"
-                    tcp_info = pcap_ip.payload.info
-                    sport = int(tcp_info.srcport)
-                    dport = int(tcp_info.dstport)
-                    # Get payload from pypcapkit
-                    if hasattr(pcap_ip.payload.payload, 'data'):
-                        payload = pcap_ip.payload.payload.data
-                elif isinstance(pcap_ip.payload, PcapUDP):
+                    sport = getattr(packet[TCP], "sport", sport)
+                    dport = getattr(packet[TCP], "dport", dport)
+                elif packet.haslayer(UDP):
                     proto = "UDP"
-                    udp_info = pcap_ip.payload.info
-                    sport = int(udp_info.srcport)
-                    dport = int(udp_info.dstport)
-                    # Get payload from pypcapkit
-                    if hasattr(pcap_ip.payload.payload, 'data'):
-                        payload = pcap_ip.payload.payload.data
-                elif _HAVE_ICMP and isinstance(pcap_ip.payload, PcapICMP):
+                    sport = getattr(packet[UDP], "sport", sport)
+                    dport = getattr(packet[UDP], "dport", dport)
+                elif packet.haslayer(ICMP):
                     proto = "ICMP"
-                    icmp_info = pcap_ip.payload.info
-                    # For ICMP, use type and code as "ports"
-                    sport = str(icmp_info.type)
-                    dport = str(icmp_info.code)
-                    # ICMP payload
-                    if hasattr(pcap_ip.payload.payload, 'data'):
-                        payload = pcap_ip.payload.payload.data
-                else:
-                    # Check if this is ICMP using protocol number (fallback)
-                    if ip_layer.proto == 1 and packet.haslayer(ICMP):
-                        proto = "ICMP"
-                        sport = str(packet[ICMP].type)
-                        dport = str(packet[ICMP].code)
-                        # Get ICMP payload
-                        try:
-                            payload = bytes(packet[ICMP].payload)
-                        except Exception:
-                            payload = b""
-                    else:
-                        # Other protocols or fallback
-                        src_ip = ip_layer.src
-                        dst_ip = ip_layer.dst
-                        sport = getattr(packet, "sport", "")
-                        dport = getattr(packet, "dport", "")
-
-                # Special handling for ICMP if not handled by pypcapkit
-                if proto == "ICMP" and packet.haslayer(ICMP):
                     sport = str(packet[ICMP].type)
                     dport = str(packet[ICMP].code)
+                    packet_info.update(
+                        {
+                            "icmp_type": getattr(packet[ICMP], "type", None),
+                            "icmp_code": getattr(packet[ICMP], "code", None),
+                        }
+                    )
+                else:
+                    proto = ""
+            except Exception:
+                proto = ""
 
-                _pypcapkit_stats["success"] += 1
+        # 若无法识别 L4 协议则保持为空（仅做基础匹配）
 
-            except Exception as e:
-                _pypcapkit_stats["failure"] += 1
-                # Only log at debug level and occasionally to avoid spam
-                if logger.isEnabledFor(logging.DEBUG) and _pypcapkit_stats["failure"] % 100 == 0:
-                    total = _pypcapkit_stats["success"] + _pypcapkit_stats["failure"]
-                    success_rate = (_pypcapkit_stats["success"] / total * 100) if total > 0 else 0
-                    logger.debug(f"Failed to parse with pypcapkit: {e}, falling back to scapy. "
-                               f"Success rate: {success_rate:.1f}% ({_pypcapkit_stats['success']}/{total})")
-                src_ip = ip_layer.src
-                dst_ip = ip_layer.dst
-                sport = getattr(packet, "sport", "")
-                dport = getattr(packet, "dport", "")
-        else:
-            src_ip = ip_layer.src
-            dst_ip = ip_layer.dst
-            sport = getattr(packet, "sport", "")
-            dport = getattr(packet, "dport", "")
         if proto == "TCP":
             # extract seq if available
-            seq = None
+            seq: Optional[int] = None
             try:
                 seq = int(packet[TCP].seq)
             except Exception:
                 seq = None
 
+            packet_info.update(
+                {
+                    "flags": getattr(packet[TCP], "flags", None),
+                    "seq": getattr(packet[TCP], "seq", None),
+                    "ack": getattr(packet[TCP], "ack", None),
+                    "window": getattr(packet[TCP], "window", None),
+                }
+            )
+
+            # 更新 TCP flow 状态（client/server/established）
+            try:
+                self._update_tcp_flow_state(packet, src_ip, dst_ip, sport, dport, packet_info)
+            except Exception:
+                pass
+
+            # --- Protocol semantic events (HTTP/FTP auth) ---
+            # Use per-direction reassembled stream and simple parsers to derive auth success/failure.
+            # HTTP:
+            #   - client->server: remember login attempt if request path looks like login/auth
+            #   - server->client: parse response status code; if 2xx => success, 401/403 => fail
+            # FTP:
+            #   - client->server: track PASS command
+            #   - server->client: parse response code 230(success)/530(fail)
+            # 语义事件提取依赖 TCP 重组结果 ready（下方单次重组得到）。
+            # --- end semantic events ---
+
             # 行为分析：记录连接信息
             self.behavior_analyzer.track_connection(src_ip, dst_ip, sport, dport, proto)
 
-            # maintain lightweight context for metadata and recent hashes
-            ctx = self.context_manager.append_to_flow("TCP", src_ip, dst_ip, b"", sport=sport, dport=dport)
+            # Quick HTTP detection before expensive stream reassembly
+            is_likely_http = self._is_likely_http_payload(payload)
 
-            # feed reassembly manager; if seq missing, fall back to append-bytes
+            # 为 HTTP 流维护轻量级上下文（主要用于去重元数据等）
+            ctx = None
+            if is_likely_http:
+                ctx = self.context_manager.append_to_flow("TCP", src_ip, dst_ip, b"", sport=sport, dport=dport)
+
+            # 使用基于 seq 的重组逻辑；若缺少 seq，则回退到简单 buffer 方式
             ready = b""
-            # Force using context buffer for HTTP extraction (better for IDS)
-            # if seq is not None:
-            #     ready = self.reassembly_manager.append("TCP", src_ip, dst_ip, seq, payload, sport=sport, dport=dport)
-            # else:
-            # best-effort: append raw payload to context buffer and attempt HTTP extraction
-            ctx.append(payload)
-            ready = ctx.get_buffer()
+            if seq is not None:
+                # 使用 FlowReassemblerManager 做严格的按序重组
+                try:
+                    ready = self.reassembly_manager.append(
+                        "TCP", src_ip, dst_ip, seq, payload, sport=sport, dport=dport
+                    )
+                except Exception:
+                    logger.exception("Flow reassembly failed; falling back to direct payload for this segment")
+                    ready = b""
+            elif ctx is not None:
+                # best-effort: append raw payload to context buffer and attempt HTTP extraction
+                ctx.append(payload)
+                ready = ctx.get_buffer()
 
-            if ready:
+            # --- Semantic auth extraction (consume ready once) ---
+            try:
+                if ready:
+                    # --- FTP control channel (port 21) ---
+                    try:
+                        # client->server
+                        if int(dport) == 21:
+                            ftp_ctx = self.context_manager.append_to_flow("FTP", src_ip, dst_ip, b"", sport=sport, dport=dport)
+                            buf = ftp_ctx.meta.setdefault("ftp_c2s_buf", bytearray())
+                            buf.extend(ready)
+                            if len(buf) > 8192:
+                                del buf[: len(buf) - 8192]
+                            while True:
+                                idx = buf.find(b"\r\n")
+                                if idx < 0:
+                                    break
+                                line = bytes(buf[:idx])
+                                del buf[: idx + 2]
+                                up = line.strip().upper()
+                                if up.startswith(b"PASS "):
+                                    ftp_ctx.meta["ftp_last_pass_ts"] = time.time()
+                        # server->client
+                        if int(sport) == 21:
+                            ftp_ctx = self.context_manager.append_to_flow("FTP", dst_ip, src_ip, b"", sport=dport, dport=sport)
+                            buf = ftp_ctx.meta.setdefault("ftp_s2c_buf", bytearray())
+                            buf.extend(ready)
+                            if len(buf) > 8192:
+                                del buf[: len(buf) - 8192]
+                            while True:
+                                idx = buf.find(b"\r\n")
+                                if idx < 0:
+                                    break
+                                line = bytes(buf[:idx])
+                                del buf[: idx + 2]
+                                if len(line) >= 3 and line[:3].isdigit():
+                                    code = line[:3].decode("ascii", errors="ignore")
+                                    if code == "230":
+                                        self._track_auth_event(dst_ip, src_ip, True, "ftp")
+                                    elif code == "530":
+                                        self._track_auth_event(dst_ip, src_ip, False, "ftp")
+                    except Exception:
+                        logger.debug("FTP auth semantic parsing failed", exc_info=True)
+
+                    # --- HTTP login (best-effort) ---
+                    try:
+                        # client->server HTTP request: mark login attempt
+                        if int(dport) in (80, 8080, 8000, 443):
+                            if self._is_likely_http_payload(ready):
+                                http_ctx = self.context_manager.append_to_flow("HTTPAUTH", src_ip, dst_ip, b"", sport=sport, dport=dport)
+                                reqs, _ = extract_http_requests(ready)
+                                for r in reqs:
+                                    path = (r.get("path") or "").lower()
+                                    method = (r.get("method") or "").upper()
+                                    if method in ("POST", "PUT") and any(x in path for x in ("login", "signin", "auth", "session")):
+                                        http_ctx.meta["http_login_attempt_ts"] = time.time()
+                        # server->client HTTP response: parse status line
+                        if int(sport) in (80, 8080, 8000, 443):
+                            s = ready[:128]
+                            if s.startswith(b"HTTP/"):
+                                line_end = s.find(b"\r\n")
+                                if line_end > 0:
+                                    line = s[:line_end].decode("latin-1", errors="ignore")
+                                    parts = line.split()
+                                    if len(parts) >= 2 and parts[1].isdigit():
+                                        code = int(parts[1])
+                                        http_ctx = self.context_manager.append_to_flow("HTTPAUTH", dst_ip, src_ip, b"", sport=dport, dport=sport)
+                                        last_attempt = http_ctx.meta.get("http_login_attempt_ts")
+                                        if last_attempt and (time.time() - float(last_attempt) <= 10.0):
+                                            if 200 <= code < 400:
+                                                self._track_auth_event(dst_ip, src_ip, True, "http")
+                                            elif code in (401, 403):
+                                                self._track_auth_event(dst_ip, src_ip, False, "http")
+                    except Exception:
+                        logger.debug("HTTP auth semantic parsing failed", exc_info=True)
+            except Exception:
+                logger.debug("Semantic auth extraction failed", exc_info=True)
+
+            if ready and is_likely_http and ctx is not None:
                 # 尝试提取 HTTP 请求
                 requests, consumed = extract_http_requests(ready)
-                if consumed:
+                if consumed and seq is None:
                     # 如果来自本地 ctx.buffer（fallback），移除已消费字节
                     try:
-                        if seq is None:
-                            del ctx.buffer[:consumed]
+                        del ctx.buffer[:consumed]
                     except Exception:
                         ctx.clear()
 
@@ -227,14 +542,24 @@ class SnifferManager:
                     if method not in ("GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"): 
                         continue
 
-                    matches = match_payload(match_payload_src, "TCP", str(dport), src_ip, str(sport), dst_ip)
+                    packet_info_stream = dict(packet_info)
+                    packet_info_stream["stream"] = True
+                    matches = match_payload(
+                        match_payload_src,
+                        "TCP",
+                        str(dport),
+                        src_ip,
+                        str(sport),
+                        dst_ip,
+                        packet_info_stream,
+                    )
                     if matches:
                         logger.info(f"ALERT: Found {len(matches)} matches for HTTP request: {method} {req.get('path')}")
                         try:
                             MATCHES_FOUND.inc(len(matches))
                         except Exception:
                             pass
-                        alerter = get_alerter(broadcast_callable, loop)
+                        alerter = get_alerter(broadcast_callable, self.loop)
                         # per-extraction local tracking to avoid emitting duplicate alerts for identical matches
                         # within the same extracted HTTP request. Do not persist across requests.
                         try:
@@ -245,44 +570,310 @@ class SnifferManager:
                         sent_local = set()
                         # 去重：同一次检测按 rule_id 只发送一条即时告警（避免同一规则多模式导致重复）
                         seen = set()
-                    for m in matches:
-                        rid = m.get("rule_id")
-                        if rid in seen:
-                            continue
-                        seen.add(rid)
-                        sent_key = (rid, req_ident)
-                        if sent_key in sent_local:
-                            continue
-                        sent_local.add(sent_key)
-                        # match found
-                        # 只把匹配片段与简短上下文（method+path）作为 preview
-                        packet_summary = f"HTTP {src_ip}:{sport} -> {dst_ip} {req.get('method')} {req.get('path')}"
-                        alert_data = {
-                            "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
-                            "protocol": proto,
-                            "src_ip": src_ip,
-                            "dst_ip": dst_ip,
-                            "packet_summary": packet_summary,
-                            "match_rule": rid,
-                            "match_text": m.get("match"),
-                            "match_type": m.get("type"),
-                            # payload_preview 用于 DB/前端短摘要，优先显示 URL 而不是完整报文
-                            "payload_preview": req.get('path') or packet_summary,
-                        }
-                        try:
-                            alerter.handle_alert(alert_data)
-                        except Exception:
-                            logger.exception("[!] Alerter failed to handle alert")
+                        for m in matches:
+                            rid = m.get("rule_id")
+                            if rid in seen:
+                                continue
+                            seen.add(rid)
+                            sent_key = (rid, req_ident)
+                            if sent_key in sent_local:
+                                continue
+                            sent_local.add(sent_key)
+                            # match found
+                            # 只把匹配片段与简短上下文（method+path）作为 preview
+                            packet_summary = f"HTTP {src_ip}:{sport} -> {dst_ip} {req.get('method')} {req.get('path')}"
+                            priority = m.get("priority")
+                            alert_data = {
+                                "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
+                                "protocol": proto,
+                                "src_ip": src_ip,
+                                "dst_ip": dst_ip,
+                                "packet_summary": packet_summary,
+                                "match_rule": rid,
+                                "match_text": m.get("match"),
+                                "match_type": m.get("type"),
+                                # payload_preview 用于 DB/前端短摘要，优先显示 URL 而不是完整报文
+                                "payload_preview": req.get('path') or packet_summary,
+                                # 添加上下文信息
+                                "match_context": m.get("context", {}),
+                                "priority": priority,
+                                "severity": self._priority_to_severity(priority),
+                            }
+                            try:
+                                alerter.handle_alert(alert_data)
+                                # 记录规则告警到行为分析器的关联抑制系统
+                                from app.services.behavior_analyzer import get_behavior_analyzer
+                                b_analyzer = get_behavior_analyzer()
+                                b_analyzer.record_rule_alert(rid, src_ip, dst_ip)
+                                
+                                # 记录规则告警到关联引擎
+                                from app.services.correlation_engine import get_correlation_engine
+                                corr_engine = get_correlation_engine()
+                                corr_engine.add_alert(src_ip, rid, is_behavior=False)
+                            except Exception:
+                                logger.exception("[!] Alerter failed to handle alert")
 
             # done processing HTTP requests for this packet
-            return
+            # Continue to process non-HTTP TCP/UDP payloads for pattern matching
+            pass
 
+        # Process all TCP/UDP payloads for pattern matching (including non-HTTP traffic)
+        if proto in ("TCP", "UDP") and payload:
+            # UDP 不做重组/HTTP 抽取：保持 datagram 语义，仅对 payload 做规则匹配。
+
+            # 统一去重窗口：同一 (rule_id + flow) 在窗口内只报一次。
+            # 用于实现“单包命中后 stream 不再报”（以及 stream 命中后单包不再报）。
+            try:
+                dedupe_ctx = self.context_manager.append_to_flow(
+                    proto, src_ip, dst_ip, b"", sport=sport, dport=dport
+                )
+                dedupe_meta = dedupe_ctx.meta
+            except Exception:
+                dedupe_meta = {}
+
+            now_ts = time.time()
+            unified = dedupe_meta.setdefault("recent_unified_rule_hits", {}) if isinstance(dedupe_meta, dict) else {}
+            try:
+                for k, t in list(unified.items()):
+                    if now_ts - t > 2.0:
+                        del unified[k]
+            except Exception:
+                pass
+
+            # 额外增强：对非 HTTP 的 TCP 尝试做 stream 级匹配（更接近 Snort stream）。
+            # - 仅当能拿到 seq 时启用（依赖重组器输出连续数据）
+            # - 控制匹配窗口，避免对大流量造成 CPU 压力
+            if proto == "TCP":
+                try:
+                    seq_val = None
+                    try:
+                        seq_val = int(packet[TCP].seq) if packet.haslayer(TCP) else None
+                    except Exception:
+                        seq_val = None
+
+                    is_http_like = self._is_likely_http_payload(payload)
+                    if seq_val is not None and (not is_http_like):
+                        stream_ready = self.reassembly_manager.append(
+                            "TCP", src_ip, dst_ip, seq_val, payload, sport=sport, dport=dport
+                        )
+                        if stream_ready:
+                            from app.services.engine import match_payload
+                            from app.services.alerter import get_alerter
+                            from app.metrics import MATCHES_FOUND, PACKETS_PROCESSED
+
+                            PACKETS_PROCESSED.inc()
+
+                            stream_chunk = stream_ready[:8192]
+                            packet_info_stream = dict(packet_info)
+                            packet_info_stream["stream"] = True
+                            stream_matches = match_payload(
+                                stream_chunk,
+                                "TCP",
+                                str(dport),
+                                src_ip,
+                                str(sport),
+                                dst_ip,
+                                packet_info_stream,
+                            )
+                            if stream_matches:
+                                try:
+                                    MATCHES_FOUND.inc(len(stream_matches))
+                                except Exception:
+                                    pass
+
+                                alerter = get_alerter(broadcast_callable, self.loop)
+
+                                seen = set()
+                                for m in stream_matches:
+                                    rid = m.get("rule_id")
+                                    if rid in seen:
+                                        continue
+                                    seen.add(rid)
+
+                                    fp = f"{rid}|{src_ip}|{dst_ip}|{sport}|{dport}"
+                                    if fp in unified:
+                                        continue
+                                    unified[fp] = now_ts
+
+                                    packet_summary = f"TCP(stream) {src_ip}:{sport} -> {dst_ip}:{dport}"
+                                    preview = stream_chunk[:100].decode("utf-8", errors="ignore").strip() or packet_summary
+
+                                    priority = m.get("priority")
+                                    alert_data = {
+                                        "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
+                                        "protocol": proto,
+                                        "src_ip": src_ip,
+                                        "dst_ip": dst_ip,
+                                        "packet_summary": packet_summary,
+                                        "match_rule": rid,
+                                        "match_text": m.get("match"),
+                                        "match_type": (m.get("type") or "") + ":stream",
+                                        "payload_preview": preview,
+                                        # 添加上下文信息
+                                        "match_context": m.get("context", {}),
+                                        "priority": priority,
+                                        "severity": self._priority_to_severity(priority),
+                                    }
+                                    try:
+                                        alerter.handle_alert(alert_data)
+                                        # 记录规则告警到行为分析器的关联抑制系统
+                                        from app.services.behavior_analyzer import get_behavior_analyzer
+                                        b_analyzer = get_behavior_analyzer()
+                                        b_analyzer.record_rule_alert(rid, src_ip, dst_ip)
+                                        
+                                        # 记录规则告警到关联引擎
+                                        from app.services.correlation_engine import get_correlation_engine
+                                        corr_engine = get_correlation_engine()
+                                        corr_engine.add_alert(src_ip, rid, is_behavior=False)
+                                    except Exception:
+                                        logger.exception("[!] Alerter failed to handle stream alert")
+                except Exception:
+                    logger.exception("Stream-level TCP matching failed")
+
+            # For all TCP/UDP payloads (including those that weren't HTTP), do pattern matching
+            from app.services.engine import match_payload
+            from app.services.alerter import get_alerter
+            from app.metrics import MATCHES_FOUND, PACKETS_PROCESSED
+
+            PACKETS_PROCESSED.inc()
+
+            # For non-HTTP traffic, match the raw payload
+            packet_info_single = dict(packet_info)
+            packet_info_single["stream"] = False
+            matches = match_payload(
+                payload,
+                proto,
+                str(dport),
+                src_ip,
+                str(sport),
+                dst_ip,
+                packet_info_single,
+            )
+            if matches:
+                logger.info(f"ALERT: Found {len(matches)} matches for {proto} payload: {src_ip}:{sport} -> {dst_ip}:{dport}")
+                try:
+                    MATCHES_FOUND.inc(len(matches))
+                except Exception:
+                    pass
+                alerter = get_alerter(broadcast_callable, self.loop)
+
+                # Create packet summary for non-HTTP traffic
+                packet_summary = f"{proto} {src_ip}:{sport} -> {dst_ip}:{dport}"
+
+                # Deduplication for non-HTTP alerts
+                seen = set()
+                for m in matches:
+                    rid = m.get("rule_id")
+                    if rid in seen:
+                        continue
+                    seen.add(rid)
+
+                    # unified cross-mode dedupe
+                    fp = f"{rid}|{src_ip}|{dst_ip}|{sport}|{dport}"
+                    if fp in unified:
+                        continue
+                    unified[fp] = now_ts
+
+                    priority = m.get("priority")
+                    alert_data = {
+                        "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
+                        "protocol": proto,
+                        "src_ip": src_ip,
+                        "dst_ip": dst_ip,
+                        "packet_summary": packet_summary,
+                        "match_rule": rid,
+                        "match_text": m.get("match"),
+                        "match_type": m.get("type"),
+                        "payload_preview": payload[:100].decode('utf-8', errors='ignore').strip() or packet_summary,
+                        # 添加上下文信息
+                        "match_context": m.get("context", {}),
+                        "priority": priority,
+                        "severity": self._priority_to_severity(priority),
+                    }
+                    try:
+                        alerter.handle_alert(alert_data)
+                        # 记录规则告警到行为分析器的关联抑制系统
+                        from app.services.behavior_analyzer import get_behavior_analyzer
+                        b_analyzer = get_behavior_analyzer()
+                        b_analyzer.record_rule_alert(rid, src_ip, dst_ip)
+                        # 记录规则告警到关联引擎
+                        from app.services.correlation_engine import get_correlation_engine
+                        corr_engine = get_correlation_engine()
+                        corr_engine.add_alert(src_ip, rid, is_behavior=False)
+                    except Exception:
+                        logger.exception("[!] Alerter failed to handle alert")
+
+        elif payload:
+            # Non-TCP/UDP (e.g., ICMP or other IP protocols)
+            from app.services.engine import match_payload
+            from app.services.alerter import get_alerter
+            from app.metrics import MATCHES_FOUND, PACKETS_PROCESSED
+
+            PACKETS_PROCESSED.inc()
+
+            packet_info_single = dict(packet_info)
+            packet_info_single["stream"] = False
+            proto_for_match = proto or "IP"
+            matches = match_payload(
+                payload,
+                proto_for_match,
+                str(dport) if dport != "" else None,
+                src_ip,
+                str(sport) if sport != "" else None,
+                dst_ip,
+                packet_info_single,
+            )
+            if matches:
+                logger.info(
+                    f"ALERT: Found {len(matches)} matches for {proto_for_match} payload: {src_ip}:{sport} -> {dst_ip}:{dport}"
+                )
+                try:
+                    MATCHES_FOUND.inc(len(matches))
+                except Exception:
+                    pass
+                alerter = get_alerter(broadcast_callable, self.loop)
+
+                packet_summary = f"{proto_for_match} {src_ip}:{sport} -> {dst_ip}:{dport}"
+
+                seen = set()
+                for m in matches:
+                    rid = m.get("rule_id")
+                    if rid in seen:
+                        continue
+                    seen.add(rid)
+
+                    priority = m.get("priority")
+                    alert_data = {
+                        "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
+                        "protocol": proto_for_match,
+                        "src_ip": src_ip,
+                        "dst_ip": dst_ip,
+                        "packet_summary": packet_summary,
+                        "match_rule": rid,
+                        "match_text": m.get("match"),
+                        "match_type": m.get("type"),
+                        "payload_preview": payload[:100].decode('utf-8', errors='ignore').strip() or packet_summary,
+                        "match_context": m.get("context", {}),
+                        "priority": priority,
+                        "severity": self._priority_to_severity(priority),
+                    }
+                    try:
+                        alerter.handle_alert(alert_data)
+                        from app.services.behavior_analyzer import get_behavior_analyzer
+                        b_analyzer = get_behavior_analyzer()
+                        b_analyzer.record_rule_alert(rid, src_ip, dst_ip)
+
+                        from app.services.correlation_engine import get_correlation_engine
+                        corr_engine = get_correlation_engine()
+                        corr_engine.add_alert(src_ip, rid, is_behavior=False)
+                    except Exception:
+                        logger.exception("[!] Alerter failed to handle alert")
 
 # 全局单例实例（保持向后兼容）
 from app.config import config
 _sniffer_manager = SnifferManager(
     context_timeout=config.CONTEXT_TIMEOUT,
-    max_buffer=config.MAX_BUFFER_SIZE
+    max_buffer=config.MAX_BUFFER_SIZE,
 )
 
 # 导入pcapkit相关模块
@@ -301,6 +892,7 @@ except ImportError:
 
 # 统计信息
 _pypcapkit_stats = {"success": 0, "failure": 0}
+_pypcapkit_stats_lock = threading.Lock()
 
 
 def _get_default_broadcast_callable() -> Callable[[dict], Coroutine[Any, Any, Any]]:
@@ -338,6 +930,80 @@ def start_sniffing(interface: Optional[str] = None,
 
     if manager is None:
         manager = _sniffer_manager
+    # 注入事件循环引用，供内部告警广播使用
+    try:
+        if loop is not None:
+            manager.set_loop(loop)
+    except Exception:
+        logger.exception("Failed to set event loop on SnifferManager")
+
+    # 设置活动标志
+    manager._sniffing_active = True
 
     logger.info(f"Sniffer active on {interface or 'default'}. Filter: IP")
-    sniff(iface=interface, prn=_packet_callback_factory(loop, broadcast_callable, manager), filter="ip", store=0, promisc=True)
+    try:
+        sniff(
+            iface=interface,
+            prn=_packet_callback_factory(loop, broadcast_callable, manager),
+            filter="ip",
+            store=0,
+            promisc=True,
+        )
+    finally:
+        manager._sniffing_active = False
+
+
+def process_pcap(
+    pcap_path: str,
+    loop: Optional[asyncio.AbstractEventLoop] = None,
+    manager: Optional[SnifferManager] = None,
+    broadcast_callable: Optional[Callable[[dict], Coroutine[Any, Any, Any]]] = None,
+    max_packets: Optional[int] = None,
+) -> int:
+    """离线 PCAP 分析入口。
+
+    复用在线抓包的整个处理链路：对于 PCAP 中的每个 scapy Packet，
+    直接调用 SnifferManager.process_packet 进行协议解析、规则匹配和告警。
+
+    Args:
+        pcap_path: PCAP 文件路径
+        loop: 可选事件循环（若提供，仍可进行 WebSocket 广播；否则仅写入 DB）
+        manager: 嗅探管理器实例（默认使用全局单例）
+        broadcast_callable: 广播协程（默认使用 WebSocket manager.broadcast；离线模式可留空）
+        max_packets: 可选的最大处理包数（用于快速实验）
+
+    Returns:
+        实际处理的数据包数量
+    """
+    if manager is None:
+        manager = _sniffer_manager
+
+    # 离线分析时，如果提供循环则注入；否则只做持久化，不做 WebSocket 广播
+    if loop is not None:
+        try:
+            manager.set_loop(loop)
+        except Exception:
+            logger.exception("Failed to set event loop on SnifferManager for PCAP processing")
+
+    if broadcast_callable is None:
+        # 离线模式下可以不广播，这里提供一个空广播协程以保持接口一致性
+        async def _noop_broadcast(_: dict) -> None:  # type: ignore[override]
+            return None
+
+        broadcast_callable = _noop_broadcast
+
+    count = 0
+    try:
+        with PcapReader(pcap_path) as reader:
+            for pkt in reader:
+                manager.process_packet(pkt, broadcast_callable)
+                count += 1
+                if max_packets is not None and count >= max_packets:
+                    break
+    except FileNotFoundError:
+        logger.error("PCAP file not found: %s", pcap_path)
+    except Exception:
+        logger.exception("Error while processing PCAP file: %s", pcap_path)
+
+    logger.info("Processed %d packets from PCAP %s", count, pcap_path)
+    return count

@@ -1,7 +1,9 @@
+# -*- coding: utf-8 -*-
+import logging
+import queue
 import threading
 import time
 from typing import Callable, Optional, Dict, Any, Tuple
-import logging
 
 from app.db import SessionLocal
 from app.models.db_models import AlertModel
@@ -20,10 +22,13 @@ class Alerter:
     - 在窗口期内对同一 key 的后续告警进行计数聚合；定期 flush 时再生成聚合告警并广播/持久化。
     """
 
-    def __init__(self, broadcast_callable: Optional[Callable[[Dict[str, Any]], Any]] = None, loop=None, dedupe_window: int = 60, flush_interval: int = 5):
+    def __init__(self, broadcast_callable: Optional[Callable[[Dict[str, Any]], Any]] = None,
+                 loop=None, dedupe_window: int = None, flush_interval: int = 5):
+        from app.config import config
+        
         self.broadcast_callable = broadcast_callable
         self.loop = loop
-        self.dedupe_window = dedupe_window
+        self.dedupe_window = dedupe_window or config.DEDUPE_WINDOW
         self.flush_interval = flush_interval
 
         # ensure ALERTS_EMITTED imported
@@ -33,10 +38,22 @@ class Alerter:
             pass
 
         self._lock = threading.Lock()
-        # Aggregation buckets removed: we persist and broadcast every occurrence.
-        # No background flusher thread is started.
-        # recent alert fingerprints to suppress immediate duplicates (very short TTL)
+        # recent alert fingerprints to suppress short-time exact duplicates
         self._recent_alerts: Dict[str, float] = {}
+
+        # 后台工作线程：将慢 I/O（DB 持久化和 WebSocket 广播）从检测/嗅探线程中解耦
+        self._queue: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=10000)
+        self._stop_event = threading.Event()
+        self._worker_thread = threading.Thread(target=self._worker_loop, name="AlerterWorker", daemon=True)
+        self._worker_thread.start()
+
+    def set_loop(self, loop):
+        """设置事件循环引用"""
+        self.loop = loop
+
+    def set_broadcast_callable(self, broadcast_callable: Callable[[Dict[str, Any]], Any]):
+        """设置广播回调函数"""
+        self.broadcast_callable = broadcast_callable
 
     def _key(self, alert: Dict[str, Any]) -> Tuple[str, str, str, str]:
         # include match_text/payload context for aggregation
@@ -53,16 +70,23 @@ class Alerter:
                 s = str(val)
         else:
             s = str(val)
-        # replace non-printable/control chars with space
-        s = ''.join(ch if (32 <= ord(ch) <= 126 or ord(ch) >= 160) else ' ' for ch in s)
-        # collapse multiple spaces
-        s = ' '.join(s.split())
+        # replace non-ascii/control chars with \xNN for readability
+        def _safe_char(ch: str) -> str:
+          code = ord(ch)
+          if 32 <= code <= 126:
+            return ch
+          return f"\\x{code:02x}"
+
+        s = "".join(_safe_char(ch) for ch in s)
+        # collapse excessive whitespace
+        s = " ".join(s.split())
         if len(s) > maxlen:
             s = s[:maxlen] + '…'
         return s
 
     def handle_alert(self, alert: Dict[str, Any]):
-        # Persist and broadcast every occurrence, but suppress nearly-simultaneous exact duplicates.
+        """接收告警请求：做短时间去重，然后异步入队，由后台线程执行慢 I/O。"""
+        # 短时间窗口去重逻辑保持在锁内，保证 _recent_alerts 一致性
         with self._lock:
             # compute fingerprint
             try:
@@ -79,7 +103,7 @@ class Alerter:
             # cleanup old entries
             try:
                 for k, t in list(self._recent_alerts.items()):
-                    if now - t > 1.0:
+                    if now - t > self.dedupe_window:
                         del self._recent_alerts[k]
             except Exception:
                 pass
@@ -90,18 +114,11 @@ class Alerter:
             if fp is not None:
                 self._recent_alerts[fp] = now
 
-            try:
-                self._persist(alert)
-            except Exception:
-                logger.exception("Failed to persist alert")
-            try:
-                self._broadcast(alert)
-            except Exception:
-                logger.exception("Failed to broadcast alert")
-            try:
-                ALERTS_EMITTED.inc()
-            except Exception:
-                logger.exception("Failed to increment ALERTS_EMITTED")
+        # 将告警放入队列，由后台线程处理；队列满时丢弃并记录日志，避免阻塞嗅探线程
+        try:
+            self._queue.put_nowait(alert)
+        except queue.Full:
+            logger.warning("Alert queue is full; dropping alert to avoid blocking")
 
     def _persist(self, alert: Dict[str, Any]):
         try:
@@ -110,6 +127,19 @@ class Alerter:
             mt = self._sanitize_text(alert.get("match_text"), maxlen=400)
             pv = alert.get("payload_preview") if alert.get("payload_preview") is not None else alert.get("packet_summary")
             pv = self._sanitize_text(pv, maxlen=400)
+            priority = alert.get("priority")
+            severity = alert.get("severity")
+            if (severity is None or severity == "") and priority is not None:
+                try:
+                    pr = int(priority)
+                    if pr <= 1:
+                        severity = "high"
+                    elif pr == 2:
+                        severity = "medium"
+                    else:
+                        severity = "low"
+                except Exception:
+                    pass
             am = AlertModel(
                 rule_id=alert.get("match_rule"),
                 match_text=mt,
@@ -118,6 +148,8 @@ class Alerter:
                 pos_start=alert.get("pos_start"),
                 pos_end=alert.get("pos_end"),
                 payload_preview=pv,
+                priority=priority,
+                severity=severity,
             )
             session.add(am)
             session.commit()
@@ -144,10 +176,14 @@ class Alerter:
 
             # sanitize fields before sending over websocket to avoid binary/control chars breaking UI
             safe = dict(alert)
-            for k in ("packet_summary", "match_text", "payload_preview", "timestamp"):
+            for k in ("packet_summary", "match_text", "payload_preview", "timestamp", "details"):
                 if k in safe:
                     try:
-                        safe[k] = self._sanitize_text(safe[k])
+                        if k == "details" and isinstance(safe[k], dict):
+                            # 特殊处理details字段，保持其结构
+                            safe[k] = {key: self._sanitize_text(str(val)) for key, val in safe[k].items()}
+                        else:
+                            safe[k] = self._sanitize_text(safe[k])
                     except Exception:
                         safe[k] = ""
             import asyncio
@@ -166,17 +202,59 @@ class Alerter:
         except Exception:
             logger.exception("Unexpected error in _broadcast")
 
-    # Aggregation/flusher removed: alerts are recorded and broadcast immediately on receipt.
+    def _worker_loop(self):
+        """后台工作线程：从队列中取出告警并执行持久化和广播。"""
+        while not self._stop_event.is_set():
+            try:
+                alert = self._queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            try:
+                try:
+                    self._persist(alert)
+                except Exception:
+                    logger.exception("Failed to persist alert")
+                try:
+                    self._broadcast(alert)
+                except Exception:
+                    logger.exception("Failed to broadcast alert")
+                try:
+                    ALERTS_EMITTED.inc()
+                except Exception:
+                    logger.exception("Failed to increment ALERTS_EMITTED")
+                try:
+                    # 如果是行为分析告警，增加专门的计数器
+                    if alert.get("match_type") == "behavior":
+                        from app.metrics import BEHAVIOR_ALERTS_EMITTED
+                        BEHAVIOR_ALERTS_EMITTED.inc()
+                except Exception:
+                    logger.exception("Failed to increment BEHAVIOR_ALERTS_EMITTED")
+            finally:
+                try:
+                    self._queue.task_done()
+                except Exception:
+                    pass
 
     def stop(self):
-        # nothing to stop (no flusher thread)
-        return
+        """请求停止后台线程。"""
+        self._stop_event.set()
+        try:
+            self._worker_thread.join(timeout=1.0)
+        except Exception:
+            pass
 
 
 def get_alerter(broadcast_callable: Optional[Callable[[Dict[str, Any]], Any]] = None, loop=None) -> Alerter:
     global _ALERTER
     if _ALERTER is None:
         _ALERTER = Alerter(broadcast_callable=broadcast_callable, loop=loop)
+    else:
+        # 更新现有实例的配置
+        if broadcast_callable is not None:
+            _ALERTER.set_broadcast_callable(broadcast_callable)
+        if loop is not None:
+            _ALERTER.set_loop(loop)
     return _ALERTER
 
 

@@ -314,11 +314,14 @@ export default {
           fetch(`/api/alerts/stats?range=${range.value}&interval=30m`),
           fetch(`/api/rules/`),
         ]);
-        const j = sres.ok ? await sres.json() : {};
-        const rules = rres.ok ? await rres.json() : [];
+
+        if (!sres.ok) throw new Error(`stats api failed: ${sres.status}`);
+
+        const j = await sres.json();
+        const rulesRaw = rres.ok ? await rres.json() : [];
+        const rules = Array.isArray(rulesRaw) ? rulesRaw : rulesRaw.rules || [];
         const ruleMap = {};
         rules.forEach((rr) => {
-          // normalize pattern to string for display
           let pat = rr.pattern;
           try {
             if (Array.isArray(pat)) pat = pat.join(" | ");
@@ -336,11 +339,31 @@ export default {
           low: b.low || 0,
         }));
 
-        // compute global counts from buckets
-        counts.high = buckets.value.reduce((s, x) => s + (x.high || 0), 0);
-        counts.medium = buckets.value.reduce((s, x) => s + (x.medium || 0), 0);
-        counts.low = buckets.value.reduce((s, x) => s + (x.low || 0), 0);
-        counts.total = counts.high + counts.medium + counts.low;
+        // Global counts: from buckets if present, else use API total and fetch count for total
+        const sumHigh = buckets.value.reduce((s, x) => s + (x.high || 0), 0);
+        const sumMedium = buckets.value.reduce(
+          (s, x) => s + (x.medium || 0),
+          0,
+        );
+        const sumLow = buckets.value.reduce((s, x) => s + (x.low || 0), 0);
+        const totalFromBuckets = sumHigh + sumMedium + sumLow;
+        counts.high = sumHigh;
+        counts.medium = sumMedium;
+        counts.low = sumLow;
+        if (typeof j.total === "number") {
+          counts.total = j.total;
+        } else if (totalFromBuckets > 0) {
+          counts.total = totalFromBuckets;
+        } else {
+          // No buckets: fetch total from count API so at least total is shown
+          try {
+            const cr = await fetch("/api/alerts/count");
+            if (cr.ok) {
+              const cj = await cr.json();
+              if (typeof cj.total === "number") counts.total = cj.total;
+            }
+          } catch (_) {}
+        }
 
         topRules.value = (j.top_rules || []).map((tr) => ({
           rule_id: tr.rule_id,
@@ -352,6 +375,14 @@ export default {
         topIps.value = j.top_ips || [];
       } catch (e) {
         console.error(e);
+        // 保留上一次成功的数据，避免刷新后归零
+        try {
+          const cr = await fetch("/api/alerts/count");
+          if (cr.ok) {
+            const cj = await cr.json();
+            if (typeof cj.total === "number") counts.total = cj.total;
+          }
+        } catch (_) {}
       } finally {
         loading.value = false;
       }

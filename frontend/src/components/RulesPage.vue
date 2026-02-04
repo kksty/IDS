@@ -8,11 +8,9 @@
           <span>规则管理</span>
         </div>
         <div class="header-actions">
-          <!-- 规则计数显示 -->
           <div class="rules-count-header">
             <el-tag type="info" size="small">{{ totalRules }} 个规则</el-tag>
           </div>
-          <!-- 搜索框 -->
           <el-input
             v-model="searchText"
             placeholder="搜索规则ID、名称或描述"
@@ -25,7 +23,6 @@
             </template>
           </el-input>
 
-          <!-- 筛选器 -->
           <el-input
             v-model="filterCategory"
             placeholder="输入类别搜索"
@@ -34,7 +31,6 @@
             @input="handleFilter"
           />
 
-          <!-- 标签搜索 -->
           <el-input
             v-model="filterTags"
             placeholder="输入标签搜索"
@@ -86,137 +82,169 @@
     </div>
 
     <!-- 规则列表 -->
-    <el-table
-      :data="filteredRules"
-      stripe
-      border
-      class="rules-table"
-      v-loading="loading"
-      @selection-change="handleSelectionChange"
-      ref="rulesTableRef"
-    >
-      <el-table-column type="selection" width="55" align="center" />
-      <el-table-column
-        label="#"
-        width="60"
-        align="center"
-        type="index"
-        :index="(index) => (currentPage - 1) * pageSize + index + 1"
-      />
-      <el-table-column
-        prop="rule_id"
-        label="规则 ID"
-        width="120"
-        show-overflow-tooltip
-      />
-      <el-table-column
-        prop="name"
-        label="规则名称"
-        width="140"
-        show-overflow-tooltip
-      />
-      <el-table-column prop="category" label="类别" width="90" align="center">
-        <template #default="scope">
-          <el-tag :type="getCategoryType(scope.row.category)" size="small">
-            {{ scope.row.category }}
-          </el-tag>
-        </template>
-      </el-table-column>
-      <el-table-column
-        prop="priority"
-        label="优先级"
-        width="70"
-        align="center"
-        sortable
+    <div class="table-wrapper-rules">
+      <el-table
+        :data="filteredRules"
+        stripe
+        border
+        class="rules-table"
+        v-loading="loading"
+        @selection-change="handleSelectionChange"
+        ref="rulesTableRef"
       >
-        <template #default="scope">
-          <el-tag :type="getPriorityType(scope.row.priority)" size="small">
-            {{ scope.row.priority }}
-          </el-tag>
-        </template>
-      </el-table-column>
-      <el-table-column prop="protocol" label="协议" width="70" align="center" />
-      <el-table-column label="匹配模式" width="200" show-overflow-tooltip>
-        <template #default="scope">
-          <div class="pattern-display">
-            <el-tag
-              :type="scope.row.pattern_type === 'pcre' ? 'warning' : 'success'"
-              size="small"
-              class="pattern-type-tag"
-            >
-              {{ scope.row.pattern_type === "pcre" ? "正则" : "字符串" }}
+        <el-table-column type="selection" width="55" align="center" />
+        <el-table-column
+          label="#"
+          width="60"
+          align="center"
+          type="index"
+          :index="(index) => (currentPage - 1) * pageSize + index + 1"
+        />
+        <el-table-column
+          prop="rule_id"
+          label="规则 ID"
+          min-width="130"
+          show-overflow-tooltip
+        />
+        <el-table-column
+          prop="name"
+          label="规则名称"
+          min-width="150"
+          show-overflow-tooltip
+        />
+        <el-table-column
+          prop="category"
+          label="类别"
+          min-width="90"
+          align="center"
+        >
+          <template #default="scope">
+            <el-tag :type="getCategoryType(scope.row.category)" size="small">
+              {{ scope.row.category }}
             </el-tag>
-            <div class="pattern-content">
-              <span class="pattern-text">{{
-                getPatternPreview(scope.row.pattern)
-              }}</span>
-              <!-- 显示Per-Content选项数量 -->
+          </template>
+        </el-table-column>
+        <el-table-column
+          prop="priority"
+          label="优先级"
+          min-width="80"
+          align="center"
+          sortable
+        >
+          <template #default="scope">
+            <el-tag :type="getPriorityType(scope.row.priority)" size="small">
+              {{ scope.row.priority }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column
+          prop="protocol"
+          label="协议"
+          min-width="72"
+          align="center"
+        />
+        <el-table-column label="匹配模式" min-width="220" show-overflow-tooltip>
+          <template #default="scope">
+            <div class="pattern-display">
               <el-tag
-                v-if="scope.row.metadata && scope.row.metadata.content_options"
-                type="info"
-                size="mini"
-                class="content-options-count"
+                :type="patternTypeTag(scope.row.pattern_type)"
+                size="small"
+                class="pattern-type-tag"
               >
-                {{ scope.row.metadata.content_options.length }} 个选项
+                {{ patternTypeLabel(scope.row.pattern_type) }}
               </el-tag>
+              <div class="pattern-content">
+                <span class="pattern-text">{{
+                  getPatternPreview(scope.row.pattern)
+                }}</span>
+                <!-- 显示Per-Content选项数量 -->
+                <el-tag
+                  v-if="
+                    scope.row.metadata && scope.row.metadata.content_options
+                  "
+                  type="info"
+                  size="mini"
+                  class="content-options-count"
+                >
+                  {{ scope.row.metadata.content_options.length }} 个选项
+                </el-tag>
+              </div>
             </div>
-          </div>
-        </template>
-      </el-table-column>
-      <el-table-column
-        prop="tags"
-        label="标签"
-        width="100"
-        show-overflow-tooltip
-      >
-        <template #default="scope">
-          <el-tooltip
-            v-if="scope.row.tags && scope.row.tags.length > 0"
-            :content="scope.row.tags.join(', ')"
-            placement="top"
-          >
-            <span class="tags-summary">
-              {{ scope.row.tags.length }} 个标签
+          </template>
+        </el-table-column>
+        <el-table-column
+          prop="tags"
+          label="标签"
+          min-width="100"
+          show-overflow-tooltip
+        >
+          <template #default="scope">
+            <el-tooltip
+              v-if="scope.row.tags && scope.row.tags.length > 0"
+              :content="scope.row.tags.join(', ')"
+              placement="top"
+            >
+              <span class="tags-summary">
+                {{ scope.row.tags.length }} 个标签
+              </span>
+            </el-tooltip>
+            <span v-else class="no-tags">无标签</span>
+          </template>
+        </el-table-column>
+        <el-table-column
+          label="创建时间"
+          min-width="140"
+          sortable
+          prop="created_at"
+        >
+          <template #default="scope">
+            <span class="created-time">
+              {{ formatDate(scope.row.created_at) }}
             </span>
-          </el-tooltip>
-          <span v-else class="no-tags">无标签</span>
-        </template>
-      </el-table-column>
-      <el-table-column label="创建时间" width="140" sortable prop="created_at">
-        <template #default="scope">
-          <span class="created-time">
-            {{ formatDate(scope.row.created_at) }}
-          </span>
-        </template>
-      </el-table-column>
-      <el-table-column
-        prop="description"
-        label="描述"
-        width="120"
-        show-overflow-tooltip
-      />
-      <el-table-column prop="enabled" label="状态" width="70" align="center">
-        <template #default="scope">
-          <el-switch
-            v-model="scope.row.enabled"
-            @change="toggleRule(scope.row)"
-            size="small"
-          />
-        </template>
-      </el-table-column>
-      <el-table-column label="操作" width="140" align="center">
-        <template #default="scope">
-          <div class="action-buttons">
-            <el-button type="primary" size="mini" @click="editRule(scope.row)">
-              编辑
-            </el-button>
-            <el-button type="danger" size="mini" @click="deleteRule(scope.row)">
-              删除
-            </el-button>
-          </div>
-        </template>
-      </el-table-column>
-    </el-table>
+          </template>
+        </el-table-column>
+        <el-table-column
+          prop="description"
+          label="描述"
+          min-width="140"
+          show-overflow-tooltip
+        />
+        <el-table-column
+          prop="enabled"
+          label="状态"
+          min-width="76"
+          align="center"
+        >
+          <template #default="scope">
+            <el-switch
+              v-model="scope.row.enabled"
+              @change="toggleRule(scope.row)"
+              size="small"
+            />
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" min-width="140" align="center">
+          <template #default="scope">
+            <div class="action-buttons">
+              <el-button
+                type="primary"
+                size="mini"
+                @click="editRule(scope.row)"
+              >
+                编辑
+              </el-button>
+              <el-button
+                type="danger"
+                size="mini"
+                @click="deleteRule(scope.row)"
+              >
+                删除
+              </el-button>
+            </div>
+          </template>
+        </el-table-column>
+      </el-table>
+    </div>
 
     <!-- 分页 -->
     <div class="pagination-wrapper">
@@ -242,16 +270,14 @@
             <div class="format-description">
               <h4>📋 基本字段</h4>
               <ul>
-                <li>
-                  <strong>规则ID：</strong
-                  >唯一标识符，只能包含字母、数字、下划线和连字符
-                </li>
-                <li><strong>规则名称：</strong>简要描述规则的作用</li>
+                <li><strong>SID：</strong>Snort 规则唯一标识符</li>
+                <li><strong>msg：</strong>告警名称（显示在告警列表）</li>
+                <li><strong>rev：</strong>规则版本号（可选）</li>
+                <li><strong>classtype：</strong>攻击分类（影响严重度）</li>
                 <li>
                   <strong>协议：</strong
                   >可选，TCP/UDP/ICMP/IP，留空表示匹配所有协议
                 </li>
-                <li><strong>优先级：</strong>1=高，2=中，3=低</li>
               </ul>
 
               <h4>🌐 网络匹配</h4>
@@ -347,7 +373,8 @@
                       <strong>within：</strong>在offset之后，限制搜索的最大范围
                     </li>
                     <li>
-                      <strong>distance：</strong>与上一个匹配的相对距离（字节）
+                      <strong>distance：</strong>相邻 content
+                      之间的最小距离（仅用于 content 规则，不等同于 relative）
                     </li>
                     <li>
                       <strong>nocase：</strong>不区分大小写匹配（仅字符串模式）
@@ -356,6 +383,21 @@
                       <strong>匹配位置选项：</strong>http_method, http_uri,
                       http_header, http_cookie, http_body, pkt_data -
                       指定内容匹配的位置
+                    </li>
+                    <li>
+                      <strong>byte_test：</strong
+                      >对payload指定偏移处的字节进行比较， 适合无 content
+                      的规则（例如 IGMP/协议字段检测）
+                    </li>
+                    <li>
+                      <strong>flow：</strong
+                      >会话方向/状态过滤（to_client/to_server/from_client/from_server
+                      + established/stateless）
+                    </li>
+                    <li>
+                      <strong>isdataat：</strong
+                      >检查指定偏移处是否还有数据（可用 ! 取反，relative
+                      相对上一个匹配位置）
                     </li>
                   </ul>
                 </div>
@@ -382,51 +424,28 @@
 
           <el-row :gutter="20">
             <el-col :span="12">
-              <el-form-item label="规则 ID" prop="rule_id">
+              <el-form-item label="SID" prop="rule_id">
                 <el-input
                   v-model="ruleForm.rule_id"
                   :disabled="isEditing"
-                  placeholder="唯一标识符，只能包含字母、数字、下划线和连字符"
+                  placeholder="Snort 规则 ID（sid）"
                 />
               </el-form-item>
             </el-col>
             <el-col :span="12">
-              <el-form-item label="规则名称" prop="name">
-                <el-input
-                  v-model="ruleForm.name"
-                  placeholder="简要描述规则的作用"
-                />
+              <el-form-item label="msg" prop="name">
+                <el-input v-model="ruleForm.name" placeholder="告警名称" />
               </el-form-item>
             </el-col>
           </el-row>
 
           <el-row :gutter="20">
-            <el-col :span="8">
-              <el-form-item label="优先级" prop="priority">
-                <el-select
-                  v-model.number="ruleForm.priority"
-                  placeholder="选择优先级"
-                >
-                  <el-option label="🔴 高" :value="1" />
-                  <el-option label="🟡 中" :value="2" />
-                  <el-option label="🟢 低" :value="3" />
-                </el-select>
-              </el-form-item>
-            </el-col>
-            <el-col :span="8">
-              <el-form-item label="类别" prop="category">
-                <el-input
-                  v-model="ruleForm.category"
-                  placeholder="输入规则类别"
-                />
-              </el-form-item>
-            </el-col>
-            <el-col :span="8">
-              <el-form-item label="协议（可选）">
+            <el-col :span="12">
+              <el-form-item label="协议" prop="protocol">
                 <el-select
                   v-model="ruleForm.protocol"
                   clearable
-                  placeholder="留空匹配所有协议"
+                  placeholder="tcp/udp/icmp/ip"
                 >
                   <el-option label="TCP" value="tcp" />
                   <el-option label="UDP" value="udp" />
@@ -435,39 +454,35 @@
                 </el-select>
               </el-form-item>
             </el-col>
+            <el-col :span="12">
+              <el-form-item label="classtype">
+                <el-input
+                  v-model="ruleForm.classtype"
+                  placeholder="如: attempted-admin"
+                />
+              </el-form-item>
+            </el-col>
           </el-row>
 
-          <el-form-item label="描述">
-            <el-input
-              v-model="ruleForm.description"
-              type="textarea"
-              :rows="2"
-              placeholder="详细描述规则的作用和触发条件"
-            />
-          </el-form-item>
-
-          <el-form-item label="标签">
-            <el-input
-              v-model="ruleForm.tags_str"
-              placeholder="用逗号分隔，如: web,sql-injection"
-            >
-              <template #suffix>
-                <el-tooltip
-                  content="用逗号分隔多个标签，如: web,sql-injection,dos。标签用于分类和搜索规则。"
-                  placement="top"
-                >
-                  <el-icon class="info-icon"><InfoFilled /></el-icon>
-                </el-tooltip>
-              </template>
-            </el-input>
-          </el-form-item>
-
-          <el-form-item label="启用状态">
-            <el-switch v-model="ruleForm.enabled" />
-            <span class="switch-hint">{{
-              ruleForm.enabled ? "规则已启用" : "规则已禁用"
-            }}</span>
-          </el-form-item>
+          <el-row :gutter="20">
+            <el-col :span="12">
+              <el-form-item label="rev">
+                <el-input
+                  v-model.number="ruleForm.rev"
+                  placeholder="如: 1"
+                  type="number"
+                />
+              </el-form-item>
+            </el-col>
+            <el-col :span="12">
+              <el-form-item label="启用状态">
+                <el-switch v-model="ruleForm.enabled" />
+                <span class="switch-hint">{{
+                  ruleForm.enabled ? "规则已启用" : "规则已禁用"
+                }}</span>
+              </el-form-item>
+            </el-col>
+          </el-row>
         </el-card>
 
         <!-- 网络匹配 -->
@@ -515,7 +530,7 @@
           </el-row>
 
           <el-row :gutter="20">
-            <el-col :span="12">
+            <el-col :span="10">
               <el-form-item label="源端口">
                 <el-input
                   v-model="ruleForm.src_ports_str"
@@ -532,7 +547,15 @@
                 </el-input>
               </el-form-item>
             </el-col>
-            <el-col :span="12">
+            <el-col :span="4">
+              <el-form-item label="方向">
+                <el-select v-model="ruleForm.direction" placeholder="方向">
+                  <el-option label="->" value="->" />
+                  <el-option label="<>" value="<>" />
+                </el-select>
+              </el-form-item>
+            </el-col>
+            <el-col :span="10">
               <el-form-item label="目标端口">
                 <el-input
                   v-model="ruleForm.dst_ports_str"
@@ -590,7 +613,7 @@
               </template>
 
               <el-row :gutter="20">
-                <el-col :span="10">
+                <el-col :span="16">
                   <el-form-item label="匹配内容" class="pattern-form-item">
                     <el-input
                       v-model="pattern.content"
@@ -609,7 +632,7 @@
                     </el-input>
                   </el-form-item>
                 </el-col>
-                <el-col :span="7">
+                <el-col :span="8">
                   <el-form-item label="匹配类型" class="pattern-form-item">
                     <el-select
                       v-model="pattern.match_type"
@@ -617,111 +640,6 @@
                     >
                       <el-option label="字符串匹配" value="string" />
                       <el-option label="正则表达式" value="regex" />
-                    </el-select>
-                  </el-form-item>
-                </el-col>
-                <el-col :span="7">
-                  <el-form-item class="pattern-form-item">
-                    <el-checkbox
-                      v-model="pattern.nocase"
-                      :disabled="pattern.match_type === 'regex'"
-                    >
-                      不区分大小写
-                    </el-checkbox>
-                  </el-form-item>
-                </el-col>
-              </el-row>
-
-              <el-row :gutter="20">
-                <el-col :span="8">
-                  <el-form-item :label="`偏移量 ${index + 1}`">
-                    <el-input
-                      v-model="pattern.offset"
-                      placeholder="如: 0"
-                      type="number"
-                    >
-                      <template #suffix>
-                        <el-tooltip
-                          content="从数据包的第N+1字节开始搜索匹配内容。0表示从开始位置搜索。"
-                          placement="top"
-                        >
-                          <el-icon class="info-icon"><InfoFilled /></el-icon>
-                        </el-tooltip>
-                      </template>
-                    </el-input>
-                  </el-form-item>
-                </el-col>
-                <el-col :span="8">
-                  <el-form-item :label="`深度 ${index + 1}`">
-                    <el-input
-                      v-model="pattern.depth"
-                      placeholder="如: 100"
-                      type="number"
-                    >
-                      <template #suffix>
-                        <el-tooltip
-                          content="从偏移位置开始，向后搜索的最大字节数。留空表示搜索到数据包结尾。"
-                          placement="top"
-                        >
-                          <el-icon class="info-icon"><InfoFilled /></el-icon>
-                        </el-tooltip>
-                      </template>
-                    </el-input>
-                  </el-form-item>
-                </el-col>
-                <el-col :span="8">
-                  <el-form-item :label="`距离 ${index + 1}`">
-                    <el-input
-                      v-model="pattern.distance"
-                      placeholder="如: 0"
-                      type="number"
-                    >
-                      <template #suffix>
-                        <el-tooltip
-                          content="与上一个匹配内容之间的相对距离（字节数）。0表示紧接着上一个匹配。"
-                          placement="top"
-                        >
-                          <el-icon class="info-icon"><InfoFilled /></el-icon>
-                        </el-tooltip>
-                      </template>
-                    </el-input>
-                  </el-form-item>
-                </el-col>
-              </el-row>
-
-              <el-row :gutter="20">
-                <el-col :span="12">
-                  <el-form-item :label="`Within ${index + 1}`">
-                    <el-input
-                      v-model="pattern.within"
-                      placeholder="如: 50"
-                      type="number"
-                    >
-                      <template #suffix>
-                        <el-tooltip
-                          content="在偏移位置之后，限制搜索的最大范围（字节数）。用于精确控制匹配位置。"
-                          placement="top"
-                        >
-                          <el-icon class="info-icon"><InfoFilled /></el-icon>
-                        </el-tooltip>
-                      </template>
-                    </el-input>
-                  </el-form-item>
-                </el-col>
-                <el-col :span="12">
-                  <el-form-item :label="`匹配位置 ${index + 1}`">
-                    <el-select
-                      v-model="pattern.http_options"
-                      multiple
-                      placeholder="选择匹配位置"
-                      collapse-tags
-                    >
-                      <el-option label="HTTP URI" value="http_uri" />
-                      <el-option label="HTTP Method" value="http_method" />
-                      <el-option label="HTTP Header" value="http_header" />
-                      <el-option label="HTTP Cookie" value="http_cookie" />
-                      <el-option label="HTTP Body" value="http_body" />
-                      <el-option label="数据包数据" value="pkt_data" />
                     </el-select>
                   </el-form-item>
                 </el-col>
@@ -735,26 +653,163 @@
           </el-button>
         </el-card>
 
-        <!-- 高级选项 -->
+        <!-- byte_test 条件 -->
+        <el-card class="form-section" shadow="never">
+          <template #header>
+            <div class="section-header section-header-with-actions">
+              <div class="section-header-left">
+                <el-icon><Cpu /></el-icon>
+                <span>Byte Test 条件</span>
+              </div>
+              <div class="section-header-actions">
+                <el-switch
+                  v-model="ruleForm.byte_test_enabled"
+                  active-text="启用"
+                  inactive-text="关闭"
+                />
+                <el-button
+                  size="small"
+                  @click="clearByteTests"
+                  :disabled="!ruleForm.byte_test_enabled"
+                >
+                  清空
+                </el-button>
+              </div>
+            </div>
+          </template>
+
+          <el-alert
+            title="byte_test 说明"
+            description="用于对原始payload指定偏移处的字节进行比较。示例：byte_test:1,>,63,0; 值支持十进制或 0x 十六进制。"
+            type="info"
+            :closable="false"
+            class="content-match-alert"
+          />
+
+          <div v-if="ruleForm.byte_test_enabled">
+            <div
+              v-for="(bt, idx) in ruleForm.byte_tests"
+              :key="idx"
+              class="pattern-item"
+            >
+              <el-card class="pattern-card" shadow="hover">
+                <template #header>
+                  <div class="pattern-header">
+                    <span class="pattern-title">Byte Test {{ idx + 1 }}</span>
+                    <el-button
+                      type="danger"
+                      size="small"
+                      @click="removeByteTest(idx)"
+                      v-if="ruleForm.byte_tests.length > 1"
+                    >
+                      删除
+                    </el-button>
+                  </div>
+                </template>
+
+                <el-row :gutter="20">
+                  <el-col :span="6">
+                    <el-form-item label="字节数">
+                      <el-input
+                        v-model.number="bt.bytes"
+                        type="number"
+                        placeholder="如: 1"
+                      />
+                    </el-form-item>
+                  </el-col>
+                  <el-col :span="6">
+                    <el-form-item label="操作符">
+                      <el-select v-model="bt.op" placeholder="选择">
+                        <el-option label=">" value=">" />
+                        <el-option label="<" value="<" />
+                        <el-option label=">=" value=">=" />
+                        <el-option label="<=" value="<=" />
+                        <el-option label="=" value="=" />
+                        <el-option label="!=" value="!=" />
+                        <el-option label="&" value="&" />
+                        <el-option label="!&" value="!&" />
+                      </el-select>
+                    </el-form-item>
+                  </el-col>
+                  <el-col :span="6">
+                    <el-form-item label="值">
+                      <el-input
+                        v-model="bt.value"
+                        placeholder="如: 63 或 0x3f"
+                      />
+                    </el-form-item>
+                  </el-col>
+                  <el-col :span="6">
+                    <el-form-item label="偏移">
+                      <el-input
+                        v-model.number="bt.offset"
+                        type="number"
+                        placeholder="如: 0"
+                      />
+                    </el-form-item>
+                  </el-col>
+                </el-row>
+
+                <el-row :gutter="20">
+                  <el-col :span="8">
+                    <el-form-item label="字节序">
+                      <el-select v-model="bt.endian" placeholder="选择">
+                        <el-option label="大端" value="big" />
+                        <el-option label="小端" value="little" />
+                      </el-select>
+                    </el-form-item>
+                  </el-col>
+                  <el-col :span="8">
+                    <el-form-item>
+                      <el-checkbox v-model="bt.relative">relative</el-checkbox>
+                    </el-form-item>
+                  </el-col>
+                </el-row>
+                <div v-if="getByteTestIssues(bt).length" class="byte-test-hint">
+                  <span
+                    v-for="(issue, i) in getByteTestIssues(bt)"
+                    :key="i"
+                    class="byte-test-hint-item"
+                  >
+                    ⚠ {{ issue }}
+                  </span>
+                </div>
+              </el-card>
+            </div>
+
+            <el-button
+              type="primary"
+              @click="addByteTest"
+              class="add-pattern-btn"
+            >
+              <el-icon><Plus /></el-icon>
+              添加 Byte Test
+            </el-button>
+          </div>
+          <div v-else class="byte-test-disabled-hint">
+            当前未启用 byte_test。需要时可在右上角切换为“启用”。
+          </div>
+        </el-card>
+
+        <!-- 规则选项 -->
         <el-card class="form-section" shadow="never">
           <template #header>
             <div class="section-header">
               <el-icon><Setting /></el-icon>
-              <span>高级选项</span>
+              <span>规则选项</span>
             </div>
           </template>
 
           <el-row :gutter="20">
             <el-col :span="12">
-              <el-form-item label="TTL">
+              <el-form-item label="Flow">
                 <el-input
-                  v-model="ruleForm.ttl"
-                  placeholder="如: 128"
-                  type="number"
+                  v-model="ruleForm.flow"
+                  placeholder="如: to_client,established"
                 >
                   <template #suffix>
                     <el-tooltip
-                      content="IP数据包的生存时间(TTL)值。用于匹配特定TTL值的数据包。"
+                      content="方向: to_client/to_server/from_client/from_server；状态: established/not_established/stateless；流: only_stream/no_stream"
                       placement="top"
                     >
                       <el-icon class="info-icon"><InfoFilled /></el-icon>
@@ -763,33 +818,16 @@
                 </el-input>
               </el-form-item>
             </el-col>
-            <el-col :span="12">
-              <el-form-item label="TOS">
-                <el-input v-model="ruleForm.tos" placeholder="如: 0x00">
-                  <template #suffix>
-                    <el-tooltip
-                      content="IP数据包的服务类型(TOS)字段。用于匹配特定的服务类型值。"
-                      placement="top"
-                    >
-                      <el-icon class="info-icon"><InfoFilled /></el-icon>
-                    </el-tooltip>
-                  </template>
-                </el-input>
-              </el-form-item>
-            </el-col>
+            <el-col :span="12"></el-col>
           </el-row>
 
           <el-row :gutter="20">
             <el-col :span="12">
-              <el-form-item label="ID">
-                <el-input
-                  v-model="ruleForm.ip_id"
-                  placeholder="如: 12345"
-                  type="number"
-                >
+              <el-form-item label="flags">
+                <el-input v-model="ruleForm.flags" placeholder="如: FS">
                   <template #suffix>
                     <el-tooltip
-                      content="IP数据包的标识符(ID)字段。用于匹配特定的IP数据包ID。"
+                      content="TCP 标志位过滤，如 S, A, F, R, P, U，可组合。"
                       placement="top"
                     >
                       <el-icon class="info-icon"><InfoFilled /></el-icon>
@@ -799,143 +837,58 @@
               </el-form-item>
             </el-col>
             <el-col :span="12">
-              <el-form-item label="IP选项">
-                <el-input v-model="ruleForm.ipopts" placeholder="如: rr">
-                  <template #suffix>
-                    <el-tooltip
-                      content="IP数据包的选项字段。用于匹配特定的IP选项，如rr(记录路由)、ts(时间戳)等。"
-                      placement="top"
-                    >
-                      <el-icon class="info-icon"><InfoFilled /></el-icon>
-                    </el-tooltip>
-                  </template>
-                </el-input>
-              </el-form-item>
-            </el-col>
-          </el-row>
-
-          <el-row :gutter="20">
-            <el-col :span="12">
-              <el-form-item label="分片标志">
-                <el-select
-                  v-model="ruleForm.fragbits"
-                  placeholder="分片标志"
-                  clearable
-                >
-                  <el-option label="M (更多分片)" value="M" />
-                  <el-option label="D (不分片)" value="D" />
-                  <el-option label="R (保留位)" value="R" />
-                </el-select>
-              </el-form-item>
-            </el-col>
-            <el-col :span="12">
-              <el-form-item label="分片偏移">
+              <el-form-item label="id">
                 <el-input
-                  v-model="ruleForm.fragoffset"
-                  placeholder="分片偏移值"
+                  v-model.number="ruleForm.ip_id"
+                  placeholder="如: 39426"
                   type="number"
                 />
               </el-form-item>
             </el-col>
           </el-row>
 
-          <el-form-item label="TCP标志">
-            <el-input v-model="ruleForm.flags" placeholder="如: SA">
-              <template #suffix>
-                <el-tooltip
-                  content="TCP数据包的标志位。用于匹配特定的TCP控制标志，如S(SYN)、A(ACK)、F(FIN)、R(RST)、P(PSH)、U(URG)等。可以组合使用，如SA表示SYN+ACK。"
-                  placement="top"
+          <el-row :gutter="20">
+            <el-col :span="12">
+              <el-form-item label="ip_proto">
+                <el-input
+                  v-model.number="ruleForm.ip_proto"
+                  placeholder="如: 88"
+                  type="number"
                 >
-                  <el-icon class="info-icon"><InfoFilled /></el-icon>
-                </el-tooltip>
-              </template>
-            </el-input>
-          </el-form-item>
+                  <template #suffix>
+                    <el-tooltip
+                      content="IP 协议号过滤，如 88 表示 EIGRP"
+                      placement="top"
+                    >
+                      <el-icon class="info-icon"><InfoFilled /></el-icon>
+                    </el-tooltip>
+                  </template>
+                </el-input>
+              </el-form-item>
+            </el-col>
+            <el-col :span="12"></el-col>
+          </el-row>
 
-          <el-form-item label="序列号">
-            <el-input
-              v-model="ruleForm.seq"
-              placeholder="如: 123456789"
-              type="number"
-            >
-              <template #suffix>
-                <el-tooltip
-                  content="TCP数据包的序列号字段。用于匹配特定的TCP序列号。"
-                  placement="top"
+          <el-row :gutter="20">
+            <el-col :span="12">
+              <el-form-item label="isdataat">
+                <el-input
+                  v-model="ruleForm.isdataat"
+                  placeholder="如: 0; !1,relative"
                 >
-                  <el-icon class="info-icon"><InfoFilled /></el-icon>
-                </el-tooltip>
-              </template>
-            </el-input>
-          </el-form-item>
-
-          <el-form-item label="确认号">
-            <el-input
-              v-model="ruleForm.ack"
-              placeholder="如: 987654321"
-              type="number"
-            >
-              <template #suffix>
-                <el-tooltip
-                  content="TCP数据包的确认号字段。用于匹配特定的TCP确认号。"
-                  placement="top"
-                >
-                  <el-icon class="info-icon"><InfoFilled /></el-icon>
-                </el-tooltip>
-              </template>
-            </el-input>
-          </el-form-item>
-
-          <el-form-item label="窗口大小">
-            <el-input
-              v-model="ruleForm.window"
-              placeholder="如: 65535"
-              type="number"
-            >
-              <template #suffix>
-                <el-tooltip
-                  content="TCP数据包的窗口大小字段。用于匹配特定的TCP窗口大小。"
-                  placement="top"
-                >
-                  <el-icon class="info-icon"><InfoFilled /></el-icon>
-                </el-tooltip>
-              </template>
-            </el-input>
-          </el-form-item>
-
-          <el-form-item label="ICMP类型">
-            <el-input
-              v-model="ruleForm.icmp_type"
-              placeholder="如: 8"
-              type="number"
-            >
-              <template #suffix>
-                <el-tooltip
-                  content="ICMP数据包的类型字段。用于匹配特定的ICMP消息类型，如8表示回显请求。"
-                  placement="top"
-                >
-                  <el-icon class="info-icon"><InfoFilled /></el-icon>
-                </el-tooltip>
-              </template>
-            </el-input>
-          </el-form-item>
-
-          <el-form-item label="ICMP代码">
-            <el-input
-              v-model="ruleForm.icmp_code"
-              placeholder="如: 0"
-              type="number"
-            >
-              <template #suffix>
-                <el-tooltip
-                  content="ICMP数据包的代码字段。用于进一步指定ICMP消息的子类型。"
-                  placement="top"
-                >
-                  <el-icon class="info-icon"><InfoFilled /></el-icon>
-                </el-tooltip>
-              </template>
-            </el-input>
-          </el-form-item>
+                  <template #suffix>
+                    <el-tooltip
+                      content="格式: isdataat:<offset>[,relative]；! 取反；relative 相对上一条 content 匹配位置；多个用分号分隔。"
+                      placement="top"
+                    >
+                      <el-icon class="info-icon"><InfoFilled /></el-icon>
+                    </el-tooltip>
+                  </template>
+                </el-input>
+              </el-form-item>
+            </el-col>
+            <el-col :span="12"></el-col>
+          </el-row>
         </el-card>
       </el-form>
       <template #footer>
@@ -1101,6 +1054,51 @@
                 </div>
               </template>
             </el-upload>
+
+            <div v-if="importSummary" class="import-summary">
+              <el-alert
+                title="导入结果摘要"
+                type="info"
+                :closable="false"
+                show-icon
+              >
+                <template #description>
+                  <div class="import-summary-grid">
+                    <div>总规则数：{{ importSummary.total }}</div>
+                    <div>成功导入：{{ importSummary.imported }}</div>
+                    <div>失败：{{ importSummary.failed }}</div>
+                    <div>含 byte_test：{{ importSummary.byteTestRules }}</div>
+                    <div>byte_test-only：{{ importSummary.byteTestOnly }}</div>
+                    <div>
+                      总 byte_test 数：{{ importSummary.totalByteTests }}
+                    </div>
+                  </div>
+                </template>
+              </el-alert>
+
+              <div
+                v-if="importSummary.failedRules.length"
+                class="import-failed-list"
+              >
+                <div class="import-failed-title">
+                  失败详情（最多展示 10 条）
+                </div>
+                <el-table
+                  :data="importSummary.failedRules.slice(0, 10)"
+                  size="small"
+                  border
+                >
+                  <el-table-column label="行号" prop="line" width="80" />
+                  <el-table-column label="原因" prop="error" min-width="200" />
+                  <el-table-column
+                    label="规则"
+                    prop="rule"
+                    min-width="260"
+                    show-overflow-tooltip
+                  />
+                </el-table>
+              </div>
+            </div>
           </div>
         </el-tab-pane>
 
@@ -1195,6 +1193,7 @@ import {
   Search,
   Monitor,
   Setting,
+  Cpu,
   Management,
   Delete,
   Check,
@@ -1214,6 +1213,7 @@ export default {
     const isEditing = ref(false);
     const importTab = ref("snort");
     const advancedOptionsActive = ref([]); // 折叠面板状态
+    const importSummary = ref(null);
 
     const currentPage = ref(1);
     const pageSize = ref(20);
@@ -1267,42 +1267,41 @@ export default {
     const ruleForm = reactive({
       rule_id: "",
       name: "",
+      action: "alert",
       protocol: null,
-      priority: 2,
-      category: "custom",
+      classtype: "",
+      rev: null,
       src: "any",
       dst: "any",
       src_ports_str: "any",
       dst_ports_str: "any",
-      description: "",
-      tags_str: "",
+      direction: "->",
       enabled: true,
       // 内容匹配
       patterns: [
         {
           content: "",
           match_type: "string",
-          nocase: false,
-          offset: null,
-          depth: null,
-          distance: null,
-          within: null,
-          http_options: [],
+        },
+      ],
+      // byte_test 规则
+      byte_test_enabled: false,
+      byte_tests: [
+        {
+          bytes: 1,
+          op: ">",
+          value: "",
+          offset: 0,
+          endian: "big",
+          relative: false,
         },
       ],
       // 高级选项
-      ttl: null,
-      tos: null,
+      flow: "",
+      isdataat: "",
+      flags: "",
       ip_id: null,
-      ipopts: null,
-      fragbits: null,
-      fragoffset: null,
-      flags: null,
-      seq: null,
-      ack: null,
-      window: null,
-      icmp_type: null,
-      icmp_code: null,
+      ip_proto: null,
     });
 
     const ruleFormRef = ref(null);
@@ -1321,20 +1320,14 @@ export default {
 
     const ruleRules = {
       rule_id: [
-        { required: true, message: "请输入规则 ID", trigger: "blur" },
+        { required: true, message: "请输入 SID", trigger: "blur" },
         {
           pattern: /^[a-zA-Z0-9_-]+$/,
-          message: "规则 ID 只能包含字母、数字、下划线和连字符",
+          message: "SID 只能包含字母、数字、下划线和连字符",
           trigger: "blur",
         },
       ],
-      name: [{ required: true, message: "请输入规则名称", trigger: "blur" }],
-      priority: [
-        { required: true, message: "请选择优先级", trigger: "change" },
-      ],
-      category: [
-        { required: true, message: "请选择规则类别", trigger: "change" },
-      ],
+      name: [{ required: true, message: "请输入 msg", trigger: "blur" }],
       src: [{ required: true, message: "请输入源IP", trigger: "blur" }],
       dst: [{ required: true, message: "请输入目标IP", trigger: "blur" }],
     };
@@ -1379,8 +1372,90 @@ export default {
       return types[priority] || "info";
     };
 
+    const patternTypeLabel = (patternType) => {
+      if (patternType === "pcre") return "正则";
+      if (patternType === "snort_byte_test") return "ByteTest";
+      return "字符串";
+    };
+
+    const patternTypeTag = (patternType) => {
+      if (patternType === "pcre") return "warning";
+      if (patternType === "snort_byte_test") return "info";
+      return "success";
+    };
+
+    const parseIsdataat = (text) => {
+      if (!text || !String(text).trim()) {
+        return { list: [], errors: [] };
+      }
+      const entries = String(text)
+        .split(/;|\n/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const list = [];
+      const errors = [];
+      entries.forEach((entry) => {
+        const parts = entry
+          .split(",")
+          .map((p) => p.trim())
+          .filter(Boolean);
+        if (!parts.length) return;
+        let first = parts[0];
+        let negated = false;
+        if (first.startsWith("!")) {
+          negated = true;
+          first = first.slice(1);
+        }
+        let offset = null;
+        if (/^0x[0-9a-f]+$/i.test(first)) {
+          offset = parseInt(first.slice(2), 16);
+        } else if (/^\d+$/.test(first)) {
+          offset = parseInt(first, 10);
+        }
+        if (offset === null || Number.isNaN(offset)) {
+          errors.push(`isdataat 偏移无效: ${entry}`);
+          return;
+        }
+        const flags = parts.slice(1).map((p) => p.toLowerCase());
+        list.push({
+          offset,
+          negated,
+          relative: flags.includes("relative"),
+          raw: entry,
+        });
+      });
+      return { list, errors };
+    };
+
+    const formatIsdataat = (list) => {
+      if (!Array.isArray(list) || list.length === 0) return "";
+      return list
+        .map((item) => {
+          if (!item || item.offset === undefined || item.offset === null)
+            return "";
+          const prefix = item.negated ? "!" : "";
+          const rel = item.relative ? ",relative" : "";
+          return `${prefix}${item.offset}${rel}`;
+        })
+        .filter(Boolean)
+        .join("; ");
+    };
+
+    const formatDate = (dateString) => {
+      if (!dateString) return "";
+      const date = new Date(dateString);
+      return date.toLocaleString("zh-CN", {
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+    };
+
     const getPatternPreview = (pattern) => {
       if (!pattern) return "";
+      if (pattern === "__BYTE_TEST_ONLY__") return "byte_test-only";
       if (typeof pattern === "string") {
         // 处理Snort格式的十六进制内容 (如 "text|hex bytes|more text")
         if (pattern.includes("|")) {
@@ -1438,16 +1513,68 @@ export default {
       return String(pattern);
     };
 
-    const formatDate = (dateString) => {
-      if (!dateString) return "";
-      const date = new Date(dateString);
-      return date.toLocaleString("zh-CN", {
-        year: "numeric",
-        month: "2-digit",
-        day: "2-digit",
-        hour: "2-digit",
-        minute: "2-digit",
-      });
+    const priorityFromClasstype = (classtype) => {
+      const map = {
+        "attempted-admin": 2,
+        "successful-admin": 1,
+        "attempted-user": 2,
+        "successful-user": 1,
+        "policy-violation": 3,
+        "attempted-dos": 2,
+        "successful-dos": 1,
+        "attempted-recon": 3,
+        "successful-recon": 2,
+        "web-application-attack": 2,
+        "bad-unknown": 3,
+        default: 3,
+      };
+      const key = (classtype || "").toLowerCase();
+      return map[key] ?? map.default;
+    };
+
+    const parseByteTestValue = (value) => {
+      if (value === null || value === undefined) return null;
+      if (typeof value === "number")
+        return Number.isFinite(value) ? value : null;
+      const text = String(value).trim();
+      if (!text) return null;
+      if (/^0x[0-9a-f]+$/i.test(text)) {
+        return parseInt(text.slice(2), 16);
+      }
+      if (/^-?\d+$/.test(text)) {
+        return parseInt(text, 10);
+      }
+      return null;
+    };
+
+    const getByteTestIssues = (bt) => {
+      const issues = [];
+      const valueEmpty =
+        bt.value === "" || bt.value === null || bt.value === undefined;
+      if (valueEmpty && !bt.relative) {
+        return issues;
+      }
+      const bytes = Number(bt.bytes);
+      const offset = Number(bt.offset);
+      if (!Number.isFinite(bytes) || bytes <= 0) {
+        issues.push("字节数必须大于 0");
+      }
+      if (!Number.isFinite(offset) || offset < 0) {
+        issues.push("偏移必须为非负数");
+      }
+      if (valueEmpty) {
+        issues.push("值不能为空");
+      } else if (parseByteTestValue(bt.value) === null) {
+        issues.push("值需为十进制或 0x 十六进制");
+      }
+      const ops = [">", "<", ">=", "<=", "=", "!=", "&", "!&"];
+      if (!ops.includes(bt.op)) {
+        issues.push("操作符不支持");
+      }
+      if (bt.relative) {
+        issues.push("relative 暂不支持");
+      }
+      return issues;
     };
 
     const loadRules = async () => {
@@ -1467,7 +1594,6 @@ export default {
           rules.value = data.rules;
           totalRules.value = data.total;
 
-          // 如果是全选模式，默认所有规则都被选中，除非在排除列表中
           if (selectAllMode.value) {
             nextTick(() => {
               rules.value.forEach((rule) => {
@@ -1476,7 +1602,6 @@ export default {
                 );
                 rulesTableRef.value?.toggleRowSelection(rule, shouldSelect);
               });
-              // 更新selectedRules
               selectedRules.value = rules.value.filter(
                 (rule) => !excludedRules.value.includes(rule.rule_id),
               );
@@ -1524,45 +1649,62 @@ export default {
       Object.assign(ruleForm, {
         rule_id: rule.rule_id,
         name: rule.name,
+        action: rule.action || "alert",
         protocol: rule.protocol,
-        priority: rule.priority,
-        category: rule.category,
+        classtype: metadata.classtype || "",
+        rev: metadata.snort_rev || metadata.rev || null,
         src: rule.src,
         dst: rule.dst,
         src_ports_str: rule.src_ports ? rule.src_ports.join(",") : "any",
         dst_ports_str: rule.dst_ports ? rule.dst_ports.join(",") : "any",
-        description: rule.description,
-        tags_str: rule.tags ? rule.tags.join(",") : "",
+        direction: rule.direction || "->",
         enabled: rule.enabled,
         // 高级选项
-        ttl: metadata.ttl || null,
-        tos: metadata.tos || null,
+        flow: metadata.flow || "",
+        isdataat: formatIsdataat(metadata.isdataat),
+        flags: metadata.flags || "",
         ip_id: metadata.ip_id || null,
-        ipopts: metadata.ipopts || null,
-        fragbits: metadata.fragbits || null,
-        fragoffset: metadata.fragoffset || null,
-        flags: metadata.flags || null,
-        seq: metadata.seq || null,
-        ack: metadata.ack || null,
-        window: metadata.window || null,
-        icmp_type: metadata.icmp_type || null,
-        icmp_code: metadata.icmp_code || null,
+        ip_proto: metadata.ip_proto || null,
       });
 
+      ruleForm.byte_tests = Array.isArray(metadata.byte_tests)
+        ? metadata.byte_tests.map((bt) => ({
+            bytes: bt.bytes ?? 1,
+            op: bt.op ?? ">",
+            value: bt.value ?? "",
+            offset: bt.offset ?? 0,
+            endian: bt.endian ?? "big",
+            relative: !!bt.relative,
+          }))
+        : [
+            {
+              bytes: 1,
+              op: ">",
+              value: "",
+              offset: 0,
+              endian: "big",
+              relative: false,
+            },
+          ];
+
+      ruleForm.byte_test_enabled =
+        (Array.isArray(metadata.byte_tests) &&
+          metadata.byte_tests.length > 0) ||
+        rule.pattern_type === "snort_byte_test";
+
       // 处理patterns
-      if (rule.pattern && Array.isArray(rule.pattern)) {
+      if (rule.pattern_type === "snort_byte_test") {
+        ruleForm.patterns = [
+          {
+            content: "",
+            match_type: "string",
+          },
+        ];
+      } else if (rule.pattern && Array.isArray(rule.pattern)) {
         ruleForm.patterns = rule.pattern.map((content, index) => {
-          const contentOptions =
-            metadata.content_options && metadata.content_options[index];
           return {
             content: content,
             match_type: rule.pattern_type === "pcre" ? "regex" : "string",
-            nocase: contentOptions?.nocase || false,
-            offset: contentOptions?.offset || null,
-            depth: contentOptions?.depth || null,
-            distance: contentOptions?.distance || null,
-            within: contentOptions?.within || null,
-            http_options: [],
           };
         });
       } else if (rule.pattern) {
@@ -1570,12 +1712,6 @@ export default {
           {
             content: rule.pattern,
             match_type: rule.pattern_type === "pcre" ? "regex" : "string",
-            nocase: metadata.nocase || false,
-            offset: metadata.offset || null,
-            depth: metadata.depth || null,
-            distance: metadata.distance || null,
-            within: metadata.within || null,
-            http_options: [],
           },
         ];
       } else {
@@ -1583,11 +1719,6 @@ export default {
           {
             content: "",
             match_type: "string",
-            offset: null,
-            depth: null,
-            distance: null,
-            within: null,
-            http_options: [],
           },
         ];
       }
@@ -1782,14 +1913,73 @@ export default {
         submitting.value = true;
 
         try {
+          const patternList = ruleForm.patterns
+            .map((p) => p.content)
+            .filter((content) => content && content.trim());
+          const byteTests = [];
+          const byteTestErrors = [];
+
+          const isdataatParsed = parseIsdataat(ruleForm.isdataat);
+          if (isdataatParsed.errors.length) {
+            ElMessage.error(isdataatParsed.errors[0]);
+            submitting.value = false;
+            return;
+          }
+
+          if (ruleForm.byte_test_enabled) {
+            (ruleForm.byte_tests || []).forEach((bt, idx) => {
+              const active =
+                bt.value !== "" && bt.value !== null && bt.value !== undefined;
+              if (!active) return;
+              const issues = getByteTestIssues(bt);
+              if (issues.length > 0) {
+                byteTestErrors.push(
+                  `Byte Test ${idx + 1}: ${issues.join("；")}`,
+                );
+                return;
+              }
+              const parsedValue = parseByteTestValue(bt.value);
+              byteTests.push({
+                bytes: Number(bt.bytes),
+                op: bt.op,
+                value: parsedValue,
+                offset: Number(bt.offset),
+                endian: bt.endian,
+                relative: !!bt.relative,
+              });
+            });
+
+            if (byteTestErrors.length) {
+              ElMessage.error(byteTestErrors[0]);
+              submitting.value = false;
+              return;
+            }
+
+            if (byteTests.length === 0) {
+              ElMessage.error(
+                "已启用 byte_test，请至少填写一个条件或关闭 byte_test",
+              );
+              submitting.value = false;
+              return;
+            }
+          }
+
+          if (patternList.length === 0 && byteTests.length === 0) {
+            ElMessage.error("至少需要一个匹配内容或一个 byte_test 条件");
+            submitting.value = false;
+            return;
+          }
+
+          const byteTestOnly = patternList.length === 0 && byteTests.length > 0;
+
           // 转换表单数据
           const ruleData = {
             rule_id: ruleForm.rule_id,
             name: ruleForm.name,
             action: "alert",
             protocol: ruleForm.protocol,
-            priority: ruleForm.priority,
-            category: ruleForm.category,
+            priority: priorityFromClasstype(ruleForm.classtype),
+            category: ruleForm.classtype || "custom",
             src: ruleForm.src,
             dst: ruleForm.dst,
             src_ports:
@@ -1800,44 +1990,26 @@ export default {
               ruleForm.dst_ports_str === "any"
                 ? null
                 : parsePorts(ruleForm.dst_ports_str),
-            direction: "->",
-            pattern: ruleForm.patterns
-              .map((p) => p.content)
-              .filter((content) => content && content.trim()),
-            pattern_type:
-              ruleForm.patterns[0]?.match_type === "regex" ? "pcre" : "string",
-            description: ruleForm.description,
-            tags: ruleForm.tags_str
-              ? ruleForm.tags_str.split(",").map((t) => t.trim())
-              : [],
+            direction: ruleForm.direction || "->",
+            pattern: byteTestOnly ? "__BYTE_TEST_ONLY__" : patternList,
+            pattern_type: byteTestOnly
+              ? "snort_byte_test"
+              : ruleForm.patterns[0]?.match_type === "regex"
+                ? "pcre"
+                : "string",
+            description: ruleForm.name,
+            tags: [],
             metadata: {
-              // 高级选项
-              ttl: ruleForm.ttl,
-              tos: ruleForm.tos,
+              snort_sid: ruleForm.rule_id,
+              snort_rev: ruleForm.rev,
+              classtype: ruleForm.classtype || undefined,
+              flow: ruleForm.flow,
+              isdataat: isdataatParsed.list,
+              flags: ruleForm.flags || undefined,
               ip_id: ruleForm.ip_id,
-              ipopts: ruleForm.ipopts,
-              fragbits: ruleForm.fragbits,
-              fragoffset: ruleForm.fragoffset,
-              flags: ruleForm.flags,
-              seq: ruleForm.seq,
-              ack: ruleForm.ack,
-              window: ruleForm.window,
-              icmp_type: ruleForm.icmp_type,
-              icmp_code: ruleForm.icmp_code,
-              // Per-content选项
-              content_options: ruleForm.patterns.map((pattern) => ({
-                offset: pattern.offset,
-                depth: pattern.depth,
-                distance: pattern.distance,
-                within: pattern.within,
-                nocase: pattern.nocase,
-                http_method: pattern.http_options.includes("http_method"),
-                http_uri: pattern.http_options.includes("http_uri"),
-                http_header: pattern.http_options.includes("http_header"),
-                http_cookie: pattern.http_options.includes("http_cookie"),
-                http_body: pattern.http_options.includes("http_body"),
-                pkt_data: pattern.http_options.includes("pkt_data"),
-              })),
+              ip_proto: ruleForm.ip_proto,
+              byte_tests: byteTests,
+              byte_test_only: byteTestOnly,
             },
             enabled: ruleForm.enabled,
           };
@@ -1887,13 +2059,41 @@ export default {
       ruleForm.patterns.push({
         content: "",
         match_type: "string",
-        nocase: false,
-        offset: null,
-        depth: null,
-        distance: null,
-        within: null,
-        http_options: [],
       });
+    };
+
+    const addByteTest = () => {
+      if (!ruleForm.byte_test_enabled) {
+        ruleForm.byte_test_enabled = true;
+      }
+      ruleForm.byte_tests.push({
+        bytes: 1,
+        op: ">",
+        value: "",
+        offset: 0,
+        endian: "big",
+        relative: false,
+      });
+    };
+
+    const removeByteTest = (index) => {
+      if (ruleForm.byte_tests.length > 1) {
+        ruleForm.byte_tests.splice(index, 1);
+      }
+    };
+
+    const clearByteTests = () => {
+      ruleForm.byte_tests = [
+        {
+          bytes: 1,
+          op: ">",
+          value: "",
+          offset: 0,
+          endian: "big",
+          relative: false,
+        },
+      ];
+      ruleForm.byte_test_enabled = false;
     };
 
     const removePattern = (index) => {
@@ -1901,41 +2101,6 @@ export default {
         ruleForm.patterns.splice(index, 1);
       }
     };
-
-    // 初始化content_options
-    const initContentOptions = () => {
-      if (ruleForm.pattern_type === "string" && ruleForm.pattern) {
-        const patterns = getPatternList();
-        if (patterns.length !== ruleForm.content_options.length) {
-          ruleForm.content_options = patterns.map(() => ({
-            distance: null,
-            offset: null,
-            depth: null,
-            within: null,
-            match_location: "pkt_data",
-            nocase: false,
-          }));
-        }
-      } else {
-        ruleForm.content_options = [];
-      }
-    };
-
-    // 监听pattern变化，初始化content_options
-    watch(
-      () => ruleForm.pattern,
-      (newPattern) => {
-        initContentOptions();
-      },
-    );
-
-    // 监听pattern_type变化
-    watch(
-      () => ruleForm.pattern_type,
-      (newType) => {
-        initContentOptions();
-      },
-    );
 
     const submitForm = () => {
       submitRule();
@@ -1950,42 +2115,40 @@ export default {
       Object.assign(ruleForm, {
         rule_id: "",
         name: "",
+        action: "alert",
         protocol: null,
-        priority: 2,
-        category: "custom",
+        classtype: "",
+        rev: null,
         src: "any",
         dst: "any",
         src_ports_str: "any",
         dst_ports_str: "any",
-        description: "",
-        tags_str: "",
+        direction: "->",
         enabled: true,
         // 重置内容匹配
         patterns: [
           {
             content: "",
             match_type: "string",
-            nocase: false,
-            offset: null,
-            depth: null,
-            distance: null,
-            within: null,
-            http_options: [],
           },
         ],
-        // 重置高级选项
-        ttl: null,
-        tos: null,
+        byte_test_enabled: false,
+        byte_tests: [
+          {
+            bytes: 1,
+            op: ">",
+            value: "",
+            offset: 0,
+            endian: "big",
+            relative: false,
+          },
+        ],
+        // 规则选项
+        flow: "",
+        isdataat: "",
+        flags: "",
         ip_id: null,
-        ipopts: null,
-        fragbits: null,
-        fragoffset: null,
-        flags: null,
-        seq: null,
-        ack: null,
-        window: null,
-        icmp_type: null,
-        icmp_code: null,
+        ip_proto: null,
       });
       isEditing.value = false;
       if (ruleFormRef.value) {
@@ -2000,6 +2163,44 @@ export default {
 
     const handleSnortImportSuccess = (response) => {
       if (response.message) {
+        const importedRules = Array.isArray(response.imported_rules)
+          ? response.imported_rules
+          : [];
+        const failedRules = Array.isArray(response.failed_rules)
+          ? response.failed_rules
+          : [];
+        const byteTestRules = importedRules.filter((rule) => {
+          const meta = rule?.metadata || {};
+          return (
+            rule?.pattern_type === "snort_byte_test" ||
+            (Array.isArray(meta.byte_tests) && meta.byte_tests.length > 0)
+          );
+        }).length;
+        const byteTestOnly = importedRules.filter((rule) => {
+          const meta = rule?.metadata || {};
+          return (
+            rule?.pattern_type === "snort_byte_test" ||
+            meta.byte_test_only === true
+          );
+        }).length;
+        const totalByteTests = importedRules.reduce((sum, rule) => {
+          const meta = rule?.metadata || {};
+          const count = Array.isArray(meta.byte_tests)
+            ? meta.byte_tests.length
+            : 0;
+          return sum + count;
+        }, 0);
+
+        importSummary.value = {
+          total: response.total || 0,
+          imported: response.imported || 0,
+          failed: response.failed || 0,
+          byteTestRules,
+          byteTestOnly,
+          totalByteTests,
+          failedRules,
+        };
+
         // 显示导入结果摘要
         if (response.failed > 0) {
           ElMessage.warning(`${response.message}。查看控制台获取失败详情。`);
@@ -2018,17 +2219,18 @@ export default {
           ElMessage.success(response.message);
         }
 
-        showImportDialog.value = false;
         loadRules();
       }
     };
 
     const handleImportError = (error) => {
       console.error("导入失败:", error);
+      importSummary.value = null;
       ElMessage.error("导入失败，请检查文件格式");
     };
 
     const beforeSnortUpload = (file) => {
+      importSummary.value = null;
       const isRules =
         file.type === "text/plain" || file.name.endsWith(".rules");
       const isLt10M = file.size / 1024 / 1024 < 10;
@@ -2238,6 +2440,7 @@ export default {
       showImportDialog,
       isEditing,
       importTab,
+      importSummary,
       currentPage,
       pageSize,
       totalRules,
@@ -2252,8 +2455,13 @@ export default {
       uploadHeaders,
       getCategoryType,
       getPriorityType,
+      patternTypeLabel,
+      patternTypeTag,
+      parseIsdataat,
+      formatIsdataat,
       getPatternPreview,
       getPatternList,
+      getByteTestIssues,
       formatDate,
       loadRules,
       toggleRule,
@@ -2272,6 +2480,9 @@ export default {
       handleCurrentChange,
       addPattern,
       removePattern,
+      addByteTest,
+      removeByteTest,
+      clearByteTests,
       submitForm,
       cancelEdit,
       // 批量操作
@@ -2309,11 +2520,12 @@ export default {
 }
 
 .rules-container {
-  padding: 20px;
-  background-color: #f5f7fa;
-  min-height: 100vh;
+  padding: 16px 0;
+  background-color: transparent;
+  min-height: 400px;
   width: 100%;
-  margin: 0 auto;
+  max-width: 100%;
+  margin: 0;
   box-sizing: border-box;
 }
 
@@ -2345,7 +2557,8 @@ export default {
 .header-actions {
   display: flex;
   align-items: center;
-  gap: 16px;
+  gap: 12px;
+  flex-wrap: wrap;
 }
 
 /* 规则计数在头部显示 */
@@ -2361,14 +2574,6 @@ export default {
   max-width: 100%;
   width: 100%;
   box-sizing: border-box;
-}
-
-/* 超大屏幕限制最大宽度 */
-@media (min-width: 1400px) {
-  .rules-container {
-    max-width: 1400px;
-    margin: 0 auto;
-  }
 }
 
 .header-wrapper {
@@ -2404,23 +2609,32 @@ export default {
 }
 
 .search-input {
-  width: 250px;
+  width: 280px;
+  min-width: 200px;
 }
 
 .filter-input {
-  width: 120px;
+  width: 140px;
+  min-width: 100px;
 }
 
 .action-btn {
   flex-shrink: 0;
 }
 
+.table-wrapper-rules {
+  width: 100%;
+  overflow-x: auto;
+  margin-top: 12px;
+  border-radius: 8px;
+  background: #fff;
+}
 .rules-table {
   border-radius: 8px;
-  overflow: hidden;
-  font-size: 12px;
-  min-width: 100%;
+  overflow: visible;
+  font-size: 13px;
   width: 100%;
+  min-width: 1600px;
 }
 
 .rules-table .el-table__cell {
@@ -2458,6 +2672,28 @@ export default {
 
 .upload-demo {
   width: 100%;
+}
+
+.import-summary {
+  margin-top: 16px;
+}
+
+.import-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 16px;
+  font-size: 13px;
+  color: #606266;
+}
+
+.import-failed-list {
+  margin-top: 12px;
+}
+
+.import-failed-title {
+  font-size: 13px;
+  color: #909399;
+  margin-bottom: 6px;
 }
 
 .dialog-footer {
@@ -2624,7 +2860,7 @@ export default {
   font-family: "Monaco", "Menlo", "Ubuntu Mono", monospace;
   font-size: 12px;
   color: #606266;
-  max-width: 200px;
+  max-width: 280px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2737,6 +2973,23 @@ export default {
   color: #303133;
 }
 
+.section-header-with-actions {
+  justify-content: space-between;
+}
+
+.section-header-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.section-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
 .section-header .el-icon {
   margin-right: 8px;
   color: #409eff;
@@ -2750,6 +3003,31 @@ export default {
 
 .content-match-alert {
   margin-bottom: 20px;
+}
+
+.byte-test-disabled-hint {
+  color: #909399;
+  font-size: 12px;
+  background: #f5f7fa;
+  border: 1px dashed #dcdfe6;
+  padding: 10px 12px;
+  border-radius: 6px;
+}
+
+.byte-test-hint {
+  margin-top: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  color: #f56c6c;
+  font-size: 12px;
+}
+
+.byte-test-hint-item {
+  background: #fef0f0;
+  border: 1px solid #fde2e2;
+  padding: 2px 6px;
+  border-radius: 4px;
 }
 
 .content-match-alert .el-alert__description {

@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 import logging
 from contextlib import asynccontextmanager
@@ -13,8 +14,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.routers import rules, websocket
 from app.routers import metrics as metrics_router
 from app.routers import alerts as alerts_router
-from app.services.sniffer import start_sniffing
+from app.routers import correlation as correlation_router
+from app.routers import system as system_router
+from app.services.system_manager import get_system_manager
 from app.config import config
+
+# 可选：安装 uvloop 以提升事件循环性能（在 Linux 上效果明显）
+try:  # pragma: no cover - 依赖可能不存在
+    import uvloop  # type: ignore
+
+    uvloop.install()
+    _UVLOOP_ENABLED = True
+except Exception:
+    _UVLOOP_ENABLED = False
 
 
 def setup_logging():
@@ -76,12 +88,6 @@ async def lifespan(app: FastAPI):
         logger.info(f"Network interface: {config.NETWORK_INTERFACE}")
         logger.info(f"Database configured: {bool(config.DATABASE_URL)}")
 
-        # 获取配置
-        target_iface = config.NETWORK_INTERFACE
-        main_loop = asyncio.get_running_loop()
-
-        logger.info(f"Starting IDS with network interface: {target_iface}")
-
         # 初始化数据库和规则引擎
         from app.db import init_db
         from app.services import engine as engine_mgr
@@ -89,16 +95,31 @@ async def lifespan(app: FastAPI):
         init_db()
         engine_mgr.load_rules_from_db()
 
-        # 启动网络嗅探线程
-        sniffer_thread = threading.Thread(
-            target=start_sniffing,
-            args=(target_iface, main_loop, websocket.manager.broadcast),
-            daemon=True,
-            name="NetworkSniffer"
-        )
-        sniffer_thread.start()
+        # 初始化系统管理器
+        system_manager = get_system_manager()
+        system_manager.set_event_loop(asyncio.get_running_loop())
+        system_manager.set_broadcast_callable(websocket.manager.broadcast)
 
-        logger.info(f"Sniffer thread started on interface {target_iface}")
+        # 将系统管理器添加到应用状态
+        app.state.system_manager = system_manager
+
+        # 默认启动抓包
+        try:
+            logger.info("Starting sniffer by default...")
+            system_manager.start_sniffer()
+            logger.info("Sniffer started successfully by default")
+        except Exception as e:
+            logger.error(f"Failed to start sniffer by default: {e}")
+
+        # 默认启动关联监控
+        try:
+            logger.info("Starting correlation monitor by default...")
+            system_manager.start_correlation_monitor()
+            logger.info("Correlation monitor started successfully by default")
+        except Exception as e:
+            logger.error(f"Failed to start correlation monitor by default: {e}")
+
+        logger.info("Application initialized successfully")
 
         yield
 
@@ -146,6 +167,8 @@ app.include_router(rules.router)
 app.include_router(websocket.router)
 app.include_router(metrics_router.router)
 app.include_router(alerts_router.router)
+app.include_router(correlation_router.router)
+app.include_router(system_router.router)
 
 
 @app.get("/health")

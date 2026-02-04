@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """规则引擎管理：维护规则集合并封装 `RuleEngine` 的重建/匹配接口。
 
 支持优化的多级匹配：
@@ -167,7 +168,8 @@ def remove_rules(rule_ids: List[str], rebuild: bool = True) -> int:
 
 def match_payload(payload: bytes, protocol: str = "", dst_port: Optional[str] = None,
                   src_ip: Optional[str] = None, src_port: Optional[str] = None,
-                  dst_ip: Optional[str] = None) -> List[Dict[str, Any]]:
+                  dst_ip: Optional[str] = None,
+                  packet_info: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """
     Args:
         payload: 要匹配的载荷数据
@@ -179,13 +181,22 @@ def match_payload(payload: bytes, protocol: str = "", dst_port: Optional[str] = 
     Returns:
         匹配结果列表
     """
+    # 在锁内一次性快照当前引擎和规则集合，避免在匹配过程中与重建线程竞争
     with _lock:
         eng = _engine
+        rules_snapshot = list(_rules)
     if eng is None:
         return []
 
-    # 1. 首先进行端口/协议/方向预过滤
-    candidate_rule_ids = _get_candidate_rules(protocol.upper(), dst_port, src_ip, src_port, dst_ip)
+    # 1. 首先进行端口/协议/方向预过滤（基于快照，避免遍历过程中被修改）
+    candidate_rule_ids = _get_candidate_rules(
+        rules_snapshot,
+        protocol.upper(),
+        dst_port,
+        src_ip,
+        src_port,
+        dst_ip,
+    )
 
     if not candidate_rule_ids:
         return []
@@ -201,19 +212,235 @@ def match_payload(payload: bytes, protocol: str = "", dst_port: Optional[str] = 
             # 从规则元数据中添加消息
             meta = eng._rule_meta.get(rule_id, {})
             match["message"] = meta.get("description", "")
+            if "priority" in meta:
+                match["priority"] = meta.get("priority")
+            # 过滤高级选项（如 ip_proto/ttl/flags/icmp 等）
+            if not _match_advanced_filters(meta, packet_info, match.get("pos"), payload):
+                continue
+            # 如果规则包含 byte_test，则必须满足 byte_test 条件
+            byte_tests = meta.get("byte_tests") or (meta.get("metadata") or {}).get("byte_tests")
+            if byte_tests:
+                if not _eval_byte_tests(payload, byte_tests):
+                    continue
             filtered_matches.append(match)
+
+    # 对 byte_test-only 规则进行检测（没有内容匹配的情况）
+    matched_rule_ids = {m.get("rule_id") for m in filtered_matches}
+    for rule_id in candidate_rule_ids:
+        if rule_id in matched_rule_ids:
+            continue
+        meta = eng._rule_meta.get(rule_id, {})
+        if not _match_advanced_filters(meta, packet_info, None, payload):
+            continue
+        byte_tests = meta.get("byte_tests") or (meta.get("metadata") or {}).get("byte_tests")
+        byte_test_only = meta.get("byte_test_only") or (meta.get("metadata") or {}).get("byte_test_only")
+        if not byte_tests:
+            continue
+        if not byte_test_only:
+            continue
+        if _eval_byte_tests(payload, byte_tests):
+            filtered_matches.append({
+                "rule_id": rule_id,
+                "match": "byte_test",
+                "type": "byte_test",
+                "message": meta.get("description", ""),
+                "priority": meta.get("priority"),
+            })
 
     return filtered_matches
 
 
-def _get_candidate_rules(protocol: str, dst_port: Optional[str] = None,
-                        src_ip: Optional[str] = None, src_port: Optional[str] = None,
-                        dst_ip: Optional[str] = None) -> List[str]:
+def _eval_byte_tests(payload: bytes, byte_tests: List[Dict[str, Any]]) -> bool:
+    """Evaluate all byte_test conditions against payload. All must pass."""
+    if not byte_tests:
+        return True
+    if payload is None:
+        return False
+    for bt in byte_tests:
+        try:
+            if bt.get("relative"):
+                # relative not supported in this lightweight implementation
+                return False
+            num_bytes = int(bt.get("bytes", 0))
+            offset = int(bt.get("offset", 0))
+            if num_bytes <= 0 or offset < 0:
+                return False
+            end = offset + num_bytes
+            if end > len(payload):
+                return False
+            endian = bt.get("endian", "big")
+            val = int.from_bytes(payload[offset:end], byteorder=endian, signed=False)
+            target = int(bt.get("value"))
+            op = str(bt.get("op"))
+            if op == ">":
+                if not (val > target):
+                    return False
+            elif op == "<":
+                if not (val < target):
+                    return False
+            elif op == ">=":
+                if not (val >= target):
+                    return False
+            elif op == "<=":
+                if not (val <= target):
+                    return False
+            elif op == "=" or op == "==":
+                if not (val == target):
+                    return False
+            elif op == "!=" or op == "!":
+                if not (val != target):
+                    return False
+            elif op == "&":
+                if not ((val & target) == target):
+                    return False
+            elif op == "!&":
+                if not ((val & target) == 0):
+                    return False
+            else:
+                # unsupported operator
+                return False
+        except Exception:
+            return False
+    return True
+
+
+def _parse_flow_tokens(flow_val: Any) -> List[str]:
+    if flow_val is None:
+        return []
+    if isinstance(flow_val, list):
+        tokens = []
+        for item in flow_val:
+            if item is None:
+                continue
+            tokens.extend([t.strip().lower() for t in str(item).split(",") if t.strip()])
+        return tokens
+    return [t.strip().lower() for t in str(flow_val).split(",") if t.strip()]
+
+
+def _normalize_flag_string(val: Any) -> str:
+    if val is None:
+        return ""
+    s = str(val).upper()
+    return "".join(ch for ch in s if ch.isalpha())
+
+
+def _match_advanced_filters(meta: Dict[str, Any], packet_info: Optional[Dict[str, Any]], match_pos: Optional[Any], payload: Optional[bytes]) -> bool:
+    if not meta:
+        return True
+    metadata = meta.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        return True
+
+    pkt = packet_info or {}
+
+    # ip_id
+    if metadata.get("ip_id") is not None:
+        try:
+            rule_ip_id = int(metadata.get("ip_id"))
+            pkt_ip_id = int(pkt.get("ip_id")) if pkt.get("ip_id") is not None else None
+        except Exception:
+            return False
+        if pkt_ip_id is None or pkt_ip_id != rule_ip_id:
+            return False
+
+    # ip_proto
+    if metadata.get("ip_proto") is not None:
+        try:
+            rule_ip_proto = int(metadata.get("ip_proto"))
+            pkt_ip_proto = int(pkt.get("ip_proto")) if pkt.get("ip_proto") is not None else None
+        except Exception:
+            return False
+        if pkt_ip_proto is None or pkt_ip_proto != rule_ip_proto:
+            return False
+
+    # TCP flags
+    rule_flags = metadata.get("flags")
+    if rule_flags:
+        pkt_flags = _normalize_flag_string(pkt.get("flags"))
+        rule_flags_norm = _normalize_flag_string(rule_flags)
+        if not pkt_flags or not rule_flags_norm:
+            return False
+        if any(flag not in pkt_flags for flag in rule_flags_norm):
+            return False
+
+    # isdataat
+    isdataat_list = metadata.get("isdataat") or []
+    if isdataat_list:
+        payload_len = len(payload) if payload is not None else 0
+        base = 0
+        if isinstance(match_pos, (list, tuple)) and len(match_pos) >= 2:
+            try:
+                base = int(match_pos[1]) + 1
+            except Exception:
+                base = 0
+        for ida in isdataat_list:
+            if not isinstance(ida, dict):
+                return False
+            offset = ida.get("offset")
+            if offset is None:
+                return False
+            try:
+                offset_val = int(offset)
+            except Exception:
+                return False
+            use_relative = bool(ida.get("relative"))
+            negated = bool(ida.get("negated"))
+            check_base = base if use_relative else 0
+            has_data = payload_len > (check_base + offset_val)
+            if negated:
+                if has_data:
+                    return False
+            else:
+                if not has_data:
+                    return False
+
+    # flow keywords
+    flow_tokens = _parse_flow_tokens(metadata.get("flow"))
+    if flow_tokens:
+        flow_dir = pkt.get("flow_dir")
+        flow_established = pkt.get("flow_established")
+        stream_flag = pkt.get("stream")
+
+        dir_expected = set()
+        if "to_client" in flow_tokens:
+            dir_expected.add("to_client")
+        if "to_server" in flow_tokens:
+            dir_expected.add("to_server")
+        if "from_client" in flow_tokens:
+            dir_expected.add("to_server")
+        if "from_server" in flow_tokens:
+            dir_expected.add("to_client")
+
+        if dir_expected:
+            if flow_dir is None or flow_dir not in dir_expected:
+                return False
+
+        if "only_stream" in flow_tokens:
+            if stream_flag is not True:
+                return False
+        if "no_stream" in flow_tokens:
+            if stream_flag is True:
+                return False
+
+        if "stateless" not in flow_tokens:
+            if "established" in flow_tokens:
+                if flow_established is not True:
+                    return False
+            if "not_established" in flow_tokens:
+                if flow_established is True:
+                    return False
+
+    return True
+
+
+def _get_candidate_rules(rules: List[Any], protocol: str, dst_port: Optional[str] = None,
+                         src_ip: Optional[str] = None, src_port: Optional[str] = None,
+                         dst_ip: Optional[str] = None) -> List[str]:
     """获取候选规则ID列表（基于端口优先级排序，所有规则都参与但按匹配度排序）"""
     candidates = []
 
-    # 获取所有规则进行方向过滤
-    for rule in _rules:
+    # 基于当前快照中的所有规则进行方向过滤
+    for rule in rules:
         if not getattr(rule, "enabled", True):
             continue
 
@@ -224,7 +451,8 @@ def _get_candidate_rules(protocol: str, dst_port: Optional[str] = None,
         # 检查协议匹配（可选）：如果规则指定了协议，则必须匹配；如果没指定，则允许
         rule_protocol = getattr(rule, "protocol", "").upper() if getattr(rule, "protocol") else ""
         if rule_protocol and rule_protocol != protocol:
-            continue  # 规则指定了特定协议但不匹配，跳过
+            if rule_protocol != "IP":
+                continue  # 规则指定了特定协议但不匹配，跳过
 
         # 检查方向匹配（现在包括IP和端口）
         direction = getattr(rule, "direction", "->")

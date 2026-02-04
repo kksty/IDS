@@ -6,8 +6,10 @@ export default defineConfig({
   server: {
     port: 3000,
     proxy: {
-      // Proxy API requests to backend during development
+      // Proxy API and backend endpoints to backend during development
       "/api": "http://localhost:8000",
+      "/health": "http://localhost:8000",
+      "/config": "http://localhost:8000",
       "/ws": {
         target: "ws://localhost:8000",
         ws: true,

@@ -15,49 +15,49 @@
     <div ref="logRef" class="log">
       <div class="log-inner">
         <div v-for="item in alerts" :key="item._local_id" class="log-entry">
-          <div class="line1">
-            <span class="ts">[{{ fmtFull(item.timestamp) }}]</span>
-            <span class="rel">({{ fmtRelative(item.timestamp) }})</span>
-            <span class="proto">{{ item.protocol }}</span>
-            <span class="summary">{{ item.packet_summary }}</span>
-          </div>
-
-          <div class="line2">
-            <span class="ips"
-              >{{ item.src_ip || "-" }} → {{ item.dst_ip || "-" }}</span
-            >
-            <span class="rule">Rule: {{ item.match_rule || "-" }}</span>
-          </div>
-
-          <div class="line3" :class="{ expanded: isExpanded(item._local_id) }">
-            <div class="payload-head">
-              <strong class="payload-label">payload：</strong>
-              <div class="actions">
-                <button
-                  class="action-btn"
-                  @click.stop="copyPayload(item)"
-                  title="复制"
-                >
-                  📋
-                </button>
-                <button
-                  class="action-btn"
-                  @click.stop="toggleExpand(item._local_id)"
-                  title="展开/收起"
-                >
-                  🔍
-                </button>
+          <div class="entry-top">
+            <div class="entry-left">
+              <div class="time-row">
+                <span class="ts">{{ fmtFull(item.timestamp) }}</span>
+                <span class="rel">{{ fmtRelative(item.timestamp) }}</span>
+              </div>
+              <div class="badge-row">
+                <span class="sev-badge" :class="severityClass(item)">
+                  {{ severityText(severityForItem(item)) }}
+                </span>
+                <span class="type-badge" :class="typeClass(item)">
+                  {{ typeText(item) }}
+                </span>
+                <span class="proto-chip">{{
+                  formatProtocol(item.protocol)
+                }}</span>
               </div>
             </div>
+            <button
+              class="action-btn"
+              @click.stop="copyPayload(item)"
+              title="复制"
+            >
+              📋
+            </button>
+          </div>
 
-            <div class="payload-body">
-              <span v-if="!isExpanded(item._local_id)">{{
-                truncateOneLine(item.match_text || item.payload_preview || "-")
-              }}</span>
-              <pre v-else class="expanded-pre">{{
-                item.match_text || item.payload_preview || "-"
-              }}</pre>
-            </div>
+          <div class="entry-mid">
+            <span class="rule-chip">{{ getRuleId(item) || "-" }}</span>
+            <span class="ips">
+              {{ item.src_ip || "-" }} → {{ item.dst_ip || "-" }}
+            </span>
+          </div>
+
+          <div class="entry-match">
+            <span class="label">规则:</span>
+            <span class="value">{{
+              truncateOneLine(payloadSummary(item), 180)
+            }}</span>
+          </div>
+
+          <div v-if="item.packet_summary" class="entry-summary">
+            {{ truncateOneLine(item.packet_summary, 180) }}
           </div>
         </div>
       </div>
@@ -74,7 +74,6 @@ export default {
     const alerts = reactive([]);
     const logRef = ref(null);
     const fullScreen = ref(false);
-    const expanded = reactive({});
     let id = 1;
 
     function scrollToTop() {
@@ -121,12 +120,82 @@ export default {
       return str;
     }
 
-    function isExpanded(key) {
-      return !!expanded[key];
+    function normalizeRuleId(rid) {
+      if (rid === null || rid === undefined) return "";
+      return String(rid).trim();
     }
 
-    function toggleExpand(key) {
-      expanded[key] = !expanded[key];
+    function getRuleId(item) {
+      if (!item) return "";
+      return normalizeRuleId(
+        item.match_rule || item.rule_id || item.rule || item.ruleId || "",
+      );
+    }
+
+    function severityForItem(item) {
+      if (!item) return "low";
+      if (item.severity) {
+        const s = String(item.severity).toLowerCase();
+        if (s.includes("high")) return "high";
+        if (s.includes("medium")) return "medium";
+        if (s.includes("low")) return "low";
+      }
+      if (item.priority !== undefined && item.priority !== null) {
+        const pr = Number(item.priority);
+        if (!Number.isNaN(pr)) {
+          if (pr <= 1) return "high";
+          if (pr === 2) return "medium";
+          return "low";
+        }
+      }
+      const rid = getRuleId(item);
+      if (rid.startsWith("behavior:")) {
+        if (
+          rid.includes("high") ||
+          rid.includes("brute") ||
+          rid.includes("suspicious")
+        )
+          return "high";
+        if (
+          rid.includes("medium") ||
+          rid.includes("port_scan") ||
+          rid.includes("oversized")
+        )
+          return "medium";
+      }
+      return "low";
+    }
+
+    function severityText(sev) {
+      if (sev === "high") return "高";
+      if (sev === "medium") return "中";
+      return "低";
+    }
+
+    function severityClass(item) {
+      const sev = severityForItem(item);
+      if (sev === "high") return "sev-high";
+      if (sev === "medium") return "sev-medium";
+      return "sev-low";
+    }
+
+    function typeText(item) {
+      const rid = getRuleId(item);
+      if (rid.startsWith("behavior:")) return "行为";
+      if (rid.startsWith("correlation:")) return "关联";
+      return "规则";
+    }
+
+    function typeClass(item) {
+      const rid = getRuleId(item);
+      if (rid.startsWith("behavior:")) return "type-behavior";
+      if (rid.startsWith("correlation:")) return "type-correlation";
+      return "type-rule";
+    }
+
+    function formatProtocol(p) {
+      if (!p) return "-";
+      return String(p).trim().toUpperCase();
     }
 
     function copyPayload(item) {
@@ -145,9 +214,46 @@ export default {
       }
     }
 
+    function getPayloadText(item) {
+      if (!item) return "";
+      return item.match_text || item.payload_preview || "-";
+    }
+
+    function splitPayload(text) {
+      const s = String(text || "");
+      const idx = s.indexOf(" | ");
+      if (idx === -1) return { summary: s, detailsRaw: "" };
+      const summary = s.slice(0, idx).trim();
+      const detailsRaw = s.slice(idx + 3).trim();
+      if (!detailsRaw.startsWith("{") && !detailsRaw.startsWith("[")) {
+        return { summary: s, detailsRaw: "" };
+      }
+      return { summary, detailsRaw };
+    }
+
+    function payloadSummary(item) {
+      return splitPayload(getPayloadText(item)).summary || "-";
+    }
+
+    function payloadDetailsRaw(item) {
+      return splitPayload(getPayloadText(item)).detailsRaw || "";
+    }
+
+    function payloadDetailsPretty(item) {
+      const raw = payloadDetailsRaw(item);
+      if (!raw) return "";
+      try {
+        const obj = JSON.parse(raw);
+        return JSON.stringify(obj, null, 2);
+      } catch (e) {
+        return raw;
+      }
+    }
+
     function onAlert(e) {
       const a = Object.assign({}, e.detail || {});
       if (!a.timestamp) a.timestamp = new Date().toISOString();
+      a.match_rule = normalizeRuleId(a.match_rule || a.rule_id || "");
       a._local_id = id++;
       alerts.unshift(a);
       if (alerts.length > 50) alerts.pop();
@@ -163,13 +269,15 @@ export default {
           for (const r of rows.reverse()) {
             const item = {
               timestamp: r.created_at || "",
-              protocol: "DB",
+              protocol: " DB",
               packet_summary: r.payload_preview || "",
-              match_rule: r.rule_id,
+              match_rule: normalizeRuleId(r.rule_id),
               match_text: r.match_text,
               payload_preview: r.payload_preview,
               src_ip: r.src_ip,
               dst_ip: r.dst_ip,
+              priority: r.priority,
+              severity: r.severity,
               _local_id: id++,
             };
             alerts.unshift(item);
@@ -191,8 +299,17 @@ export default {
       fmtFull,
       fmtRelative,
       truncateOneLine,
-      isExpanded,
-      toggleExpand,
+      getRuleId,
+      severityForItem,
+      severityText,
+      severityClass,
+      typeText,
+      typeClass,
+      formatProtocol,
+      getPayloadText,
+      payloadSummary,
+      payloadDetailsRaw,
+      payloadDetailsPretty,
       copyPayload,
     };
   },
@@ -239,63 +356,132 @@ export default {
   box-shadow: 0 4px 12px rgba(16, 24, 40, 0.06);
 }
 .log-entry {
-  background: #fff;
+  background: linear-gradient(180deg, #ffffff 0%, #fbfbff 100%);
   padding: 16px;
-  border-radius: 8px;
-  box-shadow: 0 2px 6px rgba(16, 24, 40, 0.04);
-  border: 1px solid rgba(0, 0, 0, 0.04);
+  border-radius: 10px;
+  box-shadow: 0 6px 16px rgba(16, 24, 40, 0.06);
+  border: 1px solid rgba(15, 23, 42, 0.06);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
 }
-.line1 {
-  font-weight: 700;
-  font-size: 14px;
-}
-.ts {
-  color: #6b7280;
-  margin-right: 10px;
-}
-.proto {
-  color: #0ea5e9;
-  margin-right: 10px;
-}
-.summary {
-  color: #111;
-  font-size: 15px;
-}
-.line2 {
-  font-size: 13px;
-  color: #6b7280;
-  margin-top: 8px;
-}
-.rule {
-  color: #b7791f;
-  margin-left: 12px;
-}
-.line3 {
-  margin-top: 10px;
-  color: #374151;
-  background: #fafafa;
-  padding: 10px;
-  border-radius: 8px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.line3.expanded {
-  white-space: normal;
-}
-.expanded-pre {
-  margin: 0;
-  white-space: pre-wrap;
-  font-family: Menlo, Monaco, monospace;
-}
-.payload-head {
+.entry-top {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 12px;
 }
-.actions {
+.entry-left {
   display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.time-row {
+  display: flex;
+  align-items: center;
   gap: 8px;
+  font-weight: 600;
+  font-size: 13px;
+  color: #111827;
+}
+.ts {
+  color: #6b7280;
+}
+.rel {
+  color: #9ca3af;
+  font-weight: 500;
+}
+.badge-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.proto-chip {
+  font-size: 12px;
+  color: #0ea5e9;
+  background: #e0f2fe;
+  border: 1px solid #bae6fd;
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+.sev-badge,
+.type-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  margin-right: 8px;
+  line-height: 16px;
+}
+.sev-badge.sev-high {
+  color: #b42318;
+  background: #fee4e2;
+  border-color: #fecdca;
+}
+.sev-badge.sev-medium {
+  color: #b54708;
+  background: #ffead5;
+  border-color: #fed7aa;
+}
+.sev-badge.sev-low {
+  color: #027a48;
+  background: #d1fadf;
+  border-color: #a6f4c5;
+}
+.type-badge.type-rule {
+  color: #1f6feb;
+  background: rgba(31, 111, 235, 0.1);
+  border-color: rgba(31, 111, 235, 0.3);
+}
+.type-badge.type-behavior {
+  color: #7a2e0e;
+  background: #ffe7d6;
+  border-color: #f9dbc0;
+}
+.type-badge.type-correlation {
+  color: #6b21a8;
+  background: #f3e8ff;
+  border-color: #e9d5ff;
+}
+.entry-mid {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.rule-chip {
+  font-size: 12px;
+  color: #1f2937;
+  background: #f3f4f6;
+  border: 1px solid #e5e7eb;
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+.ips {
+  font-size: 13px;
+  color: #6b7280;
+}
+.entry-match {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 13px;
+  color: #374151;
+}
+.entry-match .label {
+  color: #64748b;
+  font-weight: 600;
+}
+.entry-summary {
+  font-size: 13px;
+  color: #475569;
+  background: #f8fafc;
+  border: 1px dashed #e2e8f0;
+  padding: 8px 10px;
+  border-radius: 8px;
 }
 .action-btn {
   background: transparent;

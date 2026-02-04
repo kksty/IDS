@@ -1,169 +1,237 @@
-"""Reassembly adapter: prefer PcapKit if available, otherwise use local ReassemblyBuffer.
+# -*- coding: utf-8 -*-
+"""TCP reassembly utilities.
 
-Provides a simple per-flow reassembler manager with API:
+目标：为上层（HTTP 解析/规则匹配）提供“尽可能连续”的 TCP 字节流片段。
+
+设计取舍（适配毕业设计/工程原型）：
+- 仅实现单向（src:sport -> dst:dport）维度的重组；反向流独立建 buffer。
+- 采用 best-effort：处理乱序与重传，但不实现完整 TCP 状态机（SYN/FIN/RST）。
+- 以 per-flow 的 next_expected_seq 为基准，只在连续时吐出数据，避免重复/乱序污染上层解析。
+- 提供超时清理和内存上限控制，避免长时间运行内存泄露。
+
+API:
   manager = FlowReassemblerManager()
-  ready_bytes = manager.append(proto, src, dst, seq, data, sport, dport)
+  ready_bytes = manager.append("TCP", src, dst, seq, payload, sport, dport)
 
-If `ready_bytes` is non-empty it contains bytes that are now contiguous and ready for
-higher-layer parsing (e.g., HTTP extraction).
+若 ready_bytes 非空，代表从 next_expected_seq 起拼出的连续数据，可直接 feed 给 httptools 等流式解析器。
 """
+
 from __future__ import annotations
 
 import logging
-from typing import Dict, Optional
+import time
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger("ids.reasm_adapter")
 
-_HAVE_PCAPKIT = False  # Disable pcapkit due to parsing errors
+
+@dataclass
+class _FlowState:
+    buf: "SimpleReassemblyBuffer"
+    last_seen: float
 
 
 class FlowReassemblerManager:
-    def __init__(self, max_buffer: int = 1024 * 1024):
+    """Per-flow TCP reassembly manager."""
+
+    def __init__(
+        self,
+        max_buffer: int = 1024 * 1024,
+        flow_timeout: int = 120,
+        max_flows: int = 10000,
+    ):
         self.max_buffer = max_buffer
-        self._flows: Dict[str, object] = {}
-        self._pcapkit_flows: Dict[str, object] = {}  # Separate dict for pcapkit objects
-        self._failed_flows: set = set()  # Track flows that failed with PcapKit
-        self._use_pcapkit = _HAVE_PCAPKIT
-        if self._use_pcapkit:
-            logger.info("PcapKit available: will try to use it for TCP reassembly")
-        else:
-            logger.info("PcapKit not available: using local ReassemblyBuffer")
+        self.flow_timeout = flow_timeout
+        self.max_flows = max_flows
+        # fid -> _FlowState
+        self._flows: Dict[str, _FlowState] = {}
+
+        logger.info(
+            "Using local TCP reassembly (best-effort). max_buffer=%d flow_timeout=%ds max_flows=%d",
+            max_buffer,
+            flow_timeout,
+            max_flows,
+        )
 
     def _flow_id(self, proto: str, src: str, dst: str, sport: Optional[int], dport: Optional[int]) -> str:
         return f"{proto}:{src}:{sport}->{dst}:{dport}"
 
-    def append(self, proto: str, src: str, dst: str, seq: int, data: bytes, sport: Optional[int] = None, dport: Optional[int] = None) -> bytes:
-        fid = self._flow_id(proto, src, dst, sport, dport)
-        
-        # Check if this flow has failed with PcapKit before
-        if fid in self._failed_flows:
-            # Use local implementation for this flow
-            return self._append_local(fid, seq, data)
-        
-        # try pcapkit path if available
-        if self._use_pcapkit:
+    def _cleanup_expired(self, now: float) -> None:
+        # 删除超时 flow
+        if not self._flows:
+            return
+        expired = [fid for fid, st in self._flows.items() if now - st.last_seen > self.flow_timeout]
+        for fid in expired:
             try:
-                # Use pypcapkit's TCP_Reassembly
-                from pcapkit.foundation.reassembly import TCP_Reassembly
-                from pcapkit.foundation.reassembly.data.tcp import Packet
+                del self._flows[fid]
+            except Exception:
+                pass
 
-                obj = self._pcapkit_flows.get(fid)
-                if obj is None:
-                    obj = TCP_Reassembly()
-                    self._pcapkit_flows[fid] = obj
-                
-                # Create Packet object with correct parameters for PcapKit
-                packet_info = Packet(
-                    bufid=(src, sport, dst, dport),  # Buffer identifier as tuple
-                    dsn=seq,          # Data Sequence Number
-                    ack=0,            # Acknowledgement Number (default)
-                    num=1,            # Packet number (default)
-                    syn=False,        # Synchronise Flag
-                    fin=False,        # Finish Flag
-                    rst=False,        # Reset Flag
-                    len=len(data),    # Packet length
-                    first=seq,        # First sequence number
-                    last=seq + len(data),  # Last sequence number
-                    header=b'',       # TCP header (empty for now)
-                    payload=bytearray(data)  # Convert to mutable bytearray
-                )
-                
-                # Call reassembly
-                obj.reassembly(packet_info)
-                
-                # Get reassembled datagrams
-                datagrams = obj.datagram
-                if datagrams:
-                    # Return the latest datagram payload
-                    latest = datagrams[-1]
-                    if hasattr(latest, 'payload'):
-                        return latest.payload
-                    elif hasattr(latest, 'packet') and hasattr(latest.packet, 'raw'):
-                        return latest.packet.raw
-                        
-            except Exception as e:
-                logger.debug("PcapKit library failed to process TCP packet for flow %s (seq=%d, len=%d): %s", 
-                           fid, seq, len(data), str(e))
-                logger.warning("PcapKit TCP reassembly failed for flow %s: %s. Using local buffer for this flow.", fid, e)
-                self._failed_flows.add(fid)  # Mark this flow as failed
-                # Fall through to local implementation
-        
-        # Local ReassemblyBuffer fallback
-        return self._append_local(fid, seq, data)
-    
-    def _append_local(self, fid: str, seq: int, data: bytes) -> bytes:
-        """Local TCP reassembly implementation."""
-        buf = self._flows.get(fid)
-        if buf is None:
-            buf = SimpleReassemblyBuffer(max_buffer=self.max_buffer)
-            self._flows[fid] = buf
+        # 如果 flow 数过多，删除最久未使用的
+        if len(self._flows) > self.max_flows:
+            try:
+                # sort by last_seen asc
+                victims = sorted(self._flows.items(), key=lambda kv: kv[1].last_seen)[: max(1, len(self._flows) - self.max_flows)]
+                for fid, _ in victims:
+                    del self._flows[fid]
+            except Exception:
+                pass
+
+    def append(
+        self,
+        proto: str,
+        src: str,
+        dst: str,
+        seq: int,
+        data: bytes,
+        sport: Optional[int] = None,
+        dport: Optional[int] = None,
+    ) -> bytes:
+        """Append a TCP segment to the flow buffer.
+
+        Returns contiguous bytes starting from the flow's next_expected_seq (may be empty).
+        """
+        if not data:
+            return b""
+
+        fid = self._flow_id(proto, src, dst, sport, dport)
+        now = time.time()
+
+        # opportunistic cleanup
         try:
-            return buf.add_segment(seq, data)
+            self._cleanup_expired(now)
+        except Exception:
+            pass
+
+        st = self._flows.get(fid)
+        if st is None:
+            st = _FlowState(buf=SimpleReassemblyBuffer(max_buffer=self.max_buffer), last_seen=now)
+            self._flows[fid] = st
+        else:
+            st.last_seen = now
+
+        try:
+            return st.buf.add_segment(seq, data)
         except Exception:
             logger.exception("Local reassembly failed for flow %s", fid)
+            # reset this flow on unexpected error to avoid poisoning future parsing
+            try:
+                del self._flows[fid]
+            except Exception:
+                pass
             return b""
 
 
 class SimpleReassemblyBuffer:
-    """Simple TCP reassembly buffer - accumulates contiguous data segments."""
-    
-    def __init__(self, max_buffer: int = 1024 * 1024):
+    """Best-effort TCP reassembly buffer.
+
+    Key points:
+    - Maintain next_expected_seq.
+    - Cache out-of-order segments in a dict: seq -> bytes.
+    - Handle retransmissions by keeping the longest payload for the same seq.
+    - Only emit contiguous bytes starting from next_expected_seq.
+    """
+
+    def __init__(self, max_buffer: int = 1024 * 1024, max_out_of_order: int = 256):
         self.max_buffer = max_buffer
-        self.segments = {}  # seq -> data
-        self.next_expected_seq = None
+        self.max_out_of_order = max_out_of_order
+
+        self.segments: Dict[int, bytes] = {}
         self.total_buffered = 0
-        
+        self.next_expected_seq: Optional[int] = None
+
     def add_segment(self, seq: int, data: bytes) -> bytes:
-        """Add a TCP segment. Returns contiguous data when a complete segment is available."""
         if not data:
             return b""
-            
-        # Store the segment
-        if seq not in self.segments:
+
+        if self.next_expected_seq is None:
+            # 初始化基准 seq：以首次看到的 seq 作为起点
+            self.next_expected_seq = seq
+
+        # 如果段完全在已输出范围之前，忽略（旧重传）
+        if self.next_expected_seq is not None and seq + len(data) <= self.next_expected_seq:
+            return b""
+
+        # 如果段与 next_expected_seq 有部分重叠，裁掉已经输出过的部分
+        if self.next_expected_seq is not None and seq < self.next_expected_seq:
+            cut = self.next_expected_seq - seq
+            if cut < len(data):
+                data = data[cut:]
+                seq = self.next_expected_seq
+            else:
+                return b""
+
+        # 重传处理：同 seq 取更长的数据覆盖
+        old = self.segments.get(seq)
+        if old is None:
             self.segments[seq] = data
             self.total_buffered += len(data)
-            
-            # Check if we exceed buffer limit
-            if self.total_buffered > self.max_buffer:
-                # Clear old segments to free memory
-                oldest_seq = min(self.segments.keys())
-                removed_data = self.segments.pop(oldest_seq)
-                self.total_buffered -= len(removed_data)
-        
-        # Try to assemble contiguous data
-        return self._try_assemble_contiguous()
-        
-    def _try_assemble_contiguous(self) -> bytes:
-        """Try to assemble contiguous segments starting from the lowest sequence number."""
-        if not self.segments:
+        else:
+            if len(data) > len(old):
+                self.segments[seq] = data
+                self.total_buffered += (len(data) - len(old))
+            else:
+                # keep existing
+                pass
+
+        # 控制乱序段数量，避免被打爆
+        if len(self.segments) > self.max_out_of_order:
+            self._evict_far_segments()
+
+        # 控制总 buffer
+        if self.total_buffered > self.max_buffer:
+            self._evict_far_segments(force=True)
+
+        return self._emit_contiguous()
+
+    def _emit_contiguous(self) -> bytes:
+        if self.next_expected_seq is None:
             return b""
-            
-        # Find the lowest sequence number
-        min_seq = min(self.segments.keys())
-        result = bytearray()
-        current_seq = min_seq
-        
-        # Try to assemble contiguous blocks
-        while current_seq in self.segments:
-            segment_data = self.segments[current_seq]
-            result.extend(segment_data)
-            
-            # Remove the processed segment
-            del self.segments[current_seq]
-            self.total_buffered -= len(segment_data)
-            
-            # Move to next expected sequence
-            current_seq += len(segment_data)
-            
-            # Safety check to prevent infinite loops
-            if len(result) > self.max_buffer:
+
+        out = bytearray()
+        while True:
+            seg = self.segments.get(self.next_expected_seq)
+            if seg is None:
                 break
-                
-        # Return assembled data if we got any
-        if result:
-            return bytes(result)
-            
-        return b""
+            # consume this segment
+            del self.segments[self.next_expected_seq]
+            self.total_buffered -= len(seg)
+            out.extend(seg)
+            self.next_expected_seq += len(seg)
+
+            if len(out) >= self.max_buffer:
+                break
+
+        return bytes(out)
+
+    def _evict_far_segments(self, force: bool = False) -> None:
+        """Evict segments that are far away from next_expected_seq.
+
+        Strategy:
+        - Prefer evicting segments with the largest seq (farthest in the future).
+        - If force and still over limit, reset buffer.
+        """
+        if self.next_expected_seq is None or not self.segments:
+            return
+
+        try:
+            # sort by seq desc, remove until under thresholds
+            for s in sorted(self.segments.keys(), reverse=True):
+                if len(self.segments) <= self.max_out_of_order and self.total_buffered <= self.max_buffer:
+                    break
+                b = self.segments.pop(s, None)
+                if b is not None:
+                    self.total_buffered -= len(b)
+        except Exception:
+            # on any unexpected condition, reset
+            self.segments.clear()
+            self.total_buffered = 0
+
+        if force and (self.total_buffered > self.max_buffer):
+            # hard reset
+            self.segments.clear()
+            self.total_buffered = 0
 
 
 __all__ = ["FlowReassemblerManager"]
