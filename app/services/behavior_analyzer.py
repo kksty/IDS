@@ -64,6 +64,19 @@ class ConnectionTracker:
         self.port_scan_threshold = port_scan_threshold or config.PORT_SCAN_THRESHOLD
         self.port_scan_min_targets = config.PORT_SCAN_MIN_TARGETS
         self.port_scan_min_ports = config.PORT_SCAN_MIN_PORTS
+
+        # 端口扫描：同一 (src,dst,port,proto) 的短时间内重复包不应当被当成“多次探测”
+        self.port_scan_dedup_seconds: float = 1.0
+
+        # 端口扫描快速路径：按 src+proto 维护滑动窗口统计，避免每次遍历全量 history
+        # key: f"{src_ip}:{proto}" -> deque[(ts, dst_ip, dst_port)]
+        self._scan_events: Dict[str, deque] = defaultdict(deque)
+        self._scan_port_counts: Dict[str, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
+        self._scan_target_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        self._scan_last_seen: Dict[Tuple[str, str, int, str], float] = defaultdict(float)
+        self._scan_event_cap: int = 20000
+
+        self._lock = threading.Lock()
         self.alert_cooldown = config.BEHAVIOR_ALERT_COOLDOWN
         self.port_scan_cooldown = config.PORT_SCAN_ALERT_COOLDOWN
         self.high_conn_cooldown = config.HIGH_CONN_ALERT_COOLDOWN
@@ -79,64 +92,164 @@ class ConnectionTracker:
         key = f"{src_ip}:{dst_ip}:{proto}"
         now = time.time()
 
-        # 添加到连接历史
-        self.connections[key].append(now)
+        with self._lock:
+            # 添加到连接历史
+            self.connections[key].append(now)
 
-        # 添加端口访问历史
-        try:
-            self.port_history[key].append((now, int(dst_port)))
-            # 添加目标IP历史
-            self.target_history[f"{src_ip}:{proto}"].append((now, dst_ip))
-        except Exception:
-            # dst_port 可能是空字符串等
-            pass
+            # 添加端口访问历史
+            try:
+                self.port_history[key].append((now, int(dst_port)))
+                # 添加目标IP历史
+                self.target_history[f"{src_ip}:{proto}"].append((now, dst_ip))
+            except Exception:
+                # dst_port 可能是空字符串等
+                pass
 
-        # 清理过期记录
-        cutoff = now - self.window_size
-        while self.connections[key] and self.connections[key][0] < cutoff:
-            self.connections[key].popleft()
+            # 清理过期记录
+            cutoff = now - self.window_size
+            while self.connections[key] and self.connections[key][0] < cutoff:
+                self.connections[key].popleft()
 
-        # 检查连接频率
-        recent_connections = len(self.connections[key])
-        if recent_connections > self.max_connections:
-            last_ts = self._last_high_conn_ts.get(src_ip, 0.0)
-            if now - last_ts < self.high_conn_cooldown:
-                return None
-            self._last_high_conn_ts[src_ip] = now
-            return BehaviorAlert(
-                alert_type="high_connection_rate",
-                severity="high",
-                src_ip=src_ip,
-                description=f"High connection rate: {recent_connections} connections in {self.window_size}s",
-                details={
-                    "connection_count": recent_connections,
-                    "window_size": self.window_size,
-                    "target_ip": dst_ip,
-                    "target_port": dst_port,
-                    "protocol": protocol
-                },
-                timestamp=now
-            )
+            # 检查连接频率
+            recent_connections = len(self.connections[key])
+            if recent_connections > self.max_connections:
+                # 额外保护：仅当连接数超过更高阈值且目标/端口具备一定多样性时告警
+                min_burst = int(self.max_connections * 1.2)
+                if recent_connections < min_burst:
+                    return None
+                unique_targets = set()
+                try:
+                    tgt_key = f"{src_ip}:{proto}"
+                    dq = self.target_history.get(tgt_key, deque())
+                    unique_targets = {ip for ts, ip in dq if ts >= cutoff}
+                except Exception:
+                    unique_targets = set()
+                unique_ports = set()
+                try:
+                    dq_ports = self.port_history.get(key, deque())
+                    unique_ports = {p for ts, p in dq_ports if ts >= cutoff}
+                except Exception:
+                    unique_ports = set()
+                if len(unique_targets) < 2 and len(unique_ports) < self.port_scan_min_ports:
+                    return None
+                last_ts = self._last_high_conn_ts.get(src_ip, 0.0)
+                if now - last_ts < self.high_conn_cooldown:
+                    return None
+                self._last_high_conn_ts[src_ip] = now
+                return BehaviorAlert(
+                    alert_type="high_connection_rate",
+                    severity="high",
+                    src_ip=src_ip,
+                    description=f"High connection rate: {recent_connections} connections in {self.window_size}s",
+                    details={
+                        "connection_count": recent_connections,
+                        "window_size": self.window_size,
+                        "target_ip": dst_ip,
+                        "target_port": dst_port,
+                        "protocol": protocol
+                    },
+                    timestamp=now
+                )
 
-        # 检查端口扫描模式
-        port_scan = self._detect_port_scan(src_ip, proto)
-        if port_scan:
-            last_ts = self._last_port_scan_ts.get(src_ip, 0.0)
-            if now - last_ts < self.port_scan_cooldown:
-                return None
-            self._last_port_scan_ts[src_ip] = now
-            return BehaviorAlert(
-                alert_type="port_scan",
-                severity="medium",
-                src_ip=src_ip,
-                description=f"Port scanning detected: {port_scan.get('unique_ports')} ports in {port_scan.get('window_seconds')}s",
-                details=port_scan,
-                timestamp=now,
-            )
+            # 端口扫描统计更新（快速路径）
+            self._update_port_scan_state(src_ip, dst_ip, dst_port, proto, now)
 
+            # 检查端口扫描模式
+            port_scan = self._detect_port_scan(src_ip, proto, now=now)
+            if port_scan:
+                last_ts = self._last_port_scan_ts.get(src_ip, 0.0)
+                if now - last_ts < self.port_scan_cooldown:
+                    return None
+                self._last_port_scan_ts[src_ip] = now
+                return BehaviorAlert(
+                    alert_type="port_scan",
+                    severity="medium",
+                    src_ip=src_ip,
+                    description=f"Port scanning detected: {port_scan.get('unique_ports')} ports in {port_scan.get('window_seconds')}s",
+                    details=port_scan,
+                    timestamp=now,
+                )
         return None
 
-    def _detect_port_scan(self, src_ip: str, protocol: str) -> Optional[Dict[str, Any]]:
+    def _cleanup_scan_state(self, scan_key: str, now: float) -> None:
+        cutoff = now - self.port_scan_window
+        dq = self._scan_events.get(scan_key)
+        if not dq:
+            return
+        port_counts = self._scan_port_counts.get(scan_key)
+        target_counts = self._scan_target_counts.get(scan_key)
+        if port_counts is None or target_counts is None:
+            return
+
+        while dq and dq[0][0] < cutoff:
+            _, old_dst_ip, old_dst_port = dq.popleft()
+            try:
+                port_counts[old_dst_port] -= 1
+                if port_counts[old_dst_port] <= 0:
+                    del port_counts[old_dst_port]
+            except Exception:
+                pass
+            try:
+                target_counts[old_dst_ip] -= 1
+                if target_counts[old_dst_ip] <= 0:
+                    del target_counts[old_dst_ip]
+            except Exception:
+                pass
+
+        # hard cap，防止极端高 PPS 导致内存膨胀
+        while len(dq) > self._scan_event_cap:
+            _, old_dst_ip, old_dst_port = dq.popleft()
+            try:
+                port_counts[old_dst_port] -= 1
+                if port_counts[old_dst_port] <= 0:
+                    del port_counts[old_dst_port]
+            except Exception:
+                pass
+            try:
+                target_counts[old_dst_ip] -= 1
+                if target_counts[old_dst_ip] <= 0:
+                    del target_counts[old_dst_ip]
+            except Exception:
+                pass
+
+        if not dq:
+            # 释放空 key，降低字典规模
+            try:
+                del self._scan_events[scan_key]
+            except Exception:
+                pass
+            try:
+                del self._scan_port_counts[scan_key]
+            except Exception:
+                pass
+            try:
+                del self._scan_target_counts[scan_key]
+            except Exception:
+                pass
+
+    def _update_port_scan_state(self, src_ip: str, dst_ip: str, dst_port: int, protocol: str, now: float) -> None:
+        if (protocol or "").lower() != "tcp":
+            return
+        try:
+            p = int(dst_port)
+        except Exception:
+            return
+
+        dedup_key = (src_ip, dst_ip, p, (protocol or "").lower())
+        last_seen = self._scan_last_seen.get(dedup_key, 0.0)
+        if now - last_seen < float(self.port_scan_dedup_seconds):
+            return
+        self._scan_last_seen[dedup_key] = now
+
+        scan_key = f"{src_ip}:{(protocol or '').lower()}"
+        dq = self._scan_events[scan_key]
+        dq.append((now, dst_ip, p))
+        self._scan_port_counts[scan_key][p] += 1
+        self._scan_target_counts[scan_key][dst_ip] += 1
+
+        self._cleanup_scan_state(scan_key, now)
+
+    def _detect_port_scan(self, src_ip: str, protocol: str, now: Optional[float] = None) -> Optional[Dict[str, Any]]:
         """检测端口扫描行为
 
         规则：在 port_scan_window 内访问不同端口数超过 port_scan_threshold。
@@ -144,50 +257,41 @@ class ConnectionTracker:
         if (protocol or "").lower() != "tcp":
             return None
 
-        now = time.time()
-        cutoff = now - self.port_scan_window
-        details = {}
+        ts = float(now if now is not None else time.time())
+        scan_key = f"{src_ip}:{(protocol or '').lower()}"
+        self._cleanup_scan_state(scan_key, ts)
 
-        # 检测端口扫描
+        port_counts = self._scan_port_counts.get(scan_key)
+        target_counts = self._scan_target_counts.get(scan_key)
+        dq = self._scan_events.get(scan_key)
+        if not port_counts or not target_counts or not dq:
+            return None
+
+        unique_ports = len(port_counts)
+        unique_targets = len(target_counts)
+        total_events = len(dq)
+
         port_scan_detected = False
-        port_stats = defaultdict(int)
-        target_stats = defaultdict(int)
-        
-        # 扫描所有目标IP的端口访问情况
-        for key in list(self.port_history.keys()):
-            if key.startswith(f"{src_ip}:") and key.endswith(f":{protocol.lower()}"):
-                dq = self.port_history[key]
-                # 清理过期记录
-                while dq and dq[0][0] < cutoff:
-                    dq.popleft()
-                
-                # 统计端口访问
-                for _, port in dq:
-                    port_stats[port] += 1
-                
-                # 统计目标IP
-                target_ip = key.split(":")[1]
-                target_stats[target_ip] += len(dq)
-        
-        # 检测DDoS模式 (多个目标IP)
-        target_ips = list(target_stats.keys())
-        if len(target_ips) >= self.port_scan_min_targets:
+        details: Dict[str, Any] = {
+            "window_seconds": self.port_scan_window,
+            "total_events": total_events,
+            "unique_ports": unique_ports,
+            "unique_targets": unique_targets,
+        }
+
+        if unique_ports >= max(self.port_scan_threshold, self.port_scan_min_ports) and total_events >= self.port_scan_threshold:
+            top_ports = sorted(port_counts.items(), key=lambda kv: kv[1], reverse=True)[:50]
             details.update({
-                "unique_targets": len(target_ips),
-                "top_targets": sorted(target_ips, key=lambda x: target_stats[x], reverse=True)[:5],
-                "target_counts": {ip: target_stats[ip] for ip in target_ips[:5]}
+                "ports": [p for p, _ in top_ports],
+                "port_counts": {p: c for p, c in top_ports[:10]},
             })
             port_scan_detected = True
-        
-        # 检测端口扫描模式 (单个目标IP的多个端口)
-        ports = list(port_stats.keys())
-        if len(ports) >= self.port_scan_min_ports:
-            top_ports = sorted(ports, key=lambda x: port_stats[x], reverse=True)[:50]
+
+        if unique_targets >= self.port_scan_min_targets and total_events >= self.port_scan_threshold:
+            top_targets = sorted(target_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
             details.update({
-                "unique_ports": len(ports),
-                "ports": top_ports,
-                "port_counts": {port: port_stats[port] for port in top_ports[:10]},
-                "window_seconds": self.port_scan_window,
+                "top_targets": [ip for ip, _ in top_targets],
+                "target_counts": {ip: c for ip, c in top_targets},
             })
             port_scan_detected = True
 
@@ -392,6 +496,8 @@ class SessionTracker:
         
         self.active_sessions: Dict[str, Dict[str, Any]] = {}
         self.session_timeout = session_timeout or config.SESSION_TIMEOUT  # 1小时
+        self.session_alert_cooldown = config.BEHAVIOR_ALERT_COOLDOWN
+        self._last_session_alert_ts: Dict[str, float] = defaultdict(float)
 
     def track_session(self, src_ip: str, dst_ip: str, protocol: str, payload_size: int) -> Optional[BehaviorAlert]:
         """跟踪会话行为"""
@@ -417,11 +523,20 @@ class SessionTracker:
             bytes_per_second = session['total_bytes'] / duration
             packets_per_second = session['packet_count'] / duration
 
-            # 只对持续时间足够长的会话进行速率检查，避免短连接误报
-            min_duration_for_rate_check = 0.1  # 100ms
-            if duration >= min_duration_for_rate_check:
+            # 只对持续时间足够长且样本足够的会话进行速率检查，避免短连接误报
+            min_duration_for_rate_check = 2.0
+            min_packets_for_rate_check = 50
+            min_bytes_for_rate_check = 256 * 1024
+            if duration >= min_duration_for_rate_check and (
+                session['packet_count'] >= min_packets_for_rate_check
+                or session['total_bytes'] >= min_bytes_for_rate_check
+            ):
                 # 检测DDoS-like行为
                 if packets_per_second > 1000 or bytes_per_second > 1024*1024:  # 1MB/s
+                    last_ts = self._last_session_alert_ts.get(session_key, 0.0)
+                    if now - last_ts < self.session_alert_cooldown:
+                        return None
+                    self._last_session_alert_ts[session_key] = now
                     return BehaviorAlert(
                         alert_type="suspicious_session",
                         severity="high",
@@ -441,7 +556,7 @@ class SessionTracker:
 
         # 清理过期会话
         expired = []
-        for key, session_data in self.active_sessions.items():
+        for key, session_data in list(self.active_sessions.items()):
             if now - session_data['last_activity'] > self.session_timeout:
                 expired.append(key)
 
@@ -470,6 +585,8 @@ class BehaviorAnalyzer:
         from app.services.correlation_engine import get_correlation_engine
         self.correlation_engine = get_correlation_engine()
 
+        self._enabled = True
+
         # 关联抑制：相同 topic+key 在窗口内只发一次（避免行为与规则或多策略重复刷屏）
         self.correlation_window = 5 * 60  # 5 minutes
         self._recent_topics: Dict[str, float] = {}
@@ -481,6 +598,12 @@ class BehaviorAnalyzer:
     def add_alert_callback(self, callback: callable):
         """添加告警回调函数"""
         self.alert_callbacks.append(callback)
+
+    def set_enabled(self, enabled: bool) -> None:
+        self._enabled = bool(enabled)
+
+    def is_enabled(self) -> bool:
+        return bool(self._enabled)
 
     def process_event(self, event: Dict[str, Any]) -> List[BehaviorAlert]:
         """处理语义事件输入，并返回行为告警。
@@ -631,6 +754,8 @@ class BehaviorAnalyzer:
 
     def analyze_packet(self, packet_info: Dict[str, Any]) -> List[BehaviorAlert]:
         """分析数据包并返回行为告警"""
+        if not self._enabled:
+            return []
         alerts = []
 
         src_ip = packet_info.get('src_ip', '')
@@ -692,25 +817,29 @@ class BehaviorAnalyzer:
 
     def analyze_auth_event(self, src_ip: str, dst_ip: str, success: bool, auth_type: str = "unknown") -> Optional[BehaviorAlert]:
         """分析认证事件"""
+        if not self._enabled:
+            return None
         alert = self.auth_tracker.add_auth_event(src_ip, dst_ip, success, auth_type)
         if alert:
             # 记录到关联引擎
-                try:
-                    self.correlation_engine.add_alert(src_ip, alert.alert_type, is_behavior=True)
-                except Exception as e:
-                    logger.error(f"Failed to add behavior alert to correlation engine: {e}")
+            try:
+                self.correlation_engine.add_alert(src_ip, alert.alert_type, is_behavior=True)
+            except Exception as e:
+                logger.error(f"Failed to add behavior alert to correlation engine: {e}")
 
-                # 检查是否需要抑制（如果有同topic的规则告警）
-                if not self._should_suppress_behavior_alert(alert):
-                    if self._should_emit(alert):
-                        for callback in self.alert_callbacks:
-                            try:
-                                callback(alert)
-                            except Exception as e:
-                                logger.error(f"Auth alert callback failed: {e}")
-                else:
-                    # 抑制告警，但记录统计信息
-                    logger.debug(f"Suppressed behavior alert {alert.alert_type} for {src_ip} due to rule correlation")
+            # 检查是否需要抑制（如果有同topic的规则告警）
+            if not self._should_suppress_behavior_alert(alert):
+                if self._should_emit(alert):
+                    for callback in self.alert_callbacks:
+                        try:
+                            callback(alert)
+                        except Exception as e:
+                            logger.error(f"Auth alert callback failed: {e}")
+            else:
+                # 抑制告警，但记录统计信息
+                logger.debug(
+                    f"Suppressed behavior alert {alert.alert_type} for {src_ip} due to rule correlation"
+                )
         return alert
 
 

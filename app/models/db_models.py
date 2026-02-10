@@ -68,3 +68,17 @@ class SuspectedAttackerModel(Base):
     first_seen = Column(DateTime(timezone=True), nullable=True)
     description = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class UserModel(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String(128), unique=True, index=True, nullable=False)
+    # 预留字段：后续接入登录鉴权时可存储密码哈希（不存明文）。
+    password_hash = Column(Text, nullable=True)
+    # 角色：admin / readonly
+    role = Column(String(32), index=True, nullable=False, default="readonly")
+    is_active = Column(Boolean, default=True)
+    last_login_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())

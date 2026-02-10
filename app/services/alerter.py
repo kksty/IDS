@@ -30,6 +30,8 @@ class Alerter:
         self.loop = loop
         self.dedupe_window = dedupe_window or config.DEDUPE_WINDOW
         self.flush_interval = flush_interval
+        self.batch_size = 500
+        self.batch_flush_interval = 1.0
 
         # ensure ALERTS_EMITTED imported
         try:
@@ -161,6 +163,52 @@ class Alerter:
             except Exception:
                 pass
 
+    def _persist_batch(self, alerts: list[Dict[str, Any]]):
+        if not alerts:
+            return
+        try:
+            session = SessionLocal()
+            models = []
+            for alert in alerts:
+                mt = self._sanitize_text(alert.get("match_text"), maxlen=400)
+                pv = alert.get("payload_preview") if alert.get("payload_preview") is not None else alert.get("packet_summary")
+                pv = self._sanitize_text(pv, maxlen=400)
+                priority = alert.get("priority")
+                severity = alert.get("severity")
+                if (severity is None or severity == "") and priority is not None:
+                    try:
+                        pr = int(priority)
+                        if pr <= 1:
+                            severity = "high"
+                        elif pr == 2:
+                            severity = "medium"
+                        else:
+                            severity = "low"
+                    except Exception:
+                        pass
+                models.append(
+                    AlertModel(
+                        rule_id=alert.get("match_rule"),
+                        match_text=mt,
+                        src_ip=alert.get("src_ip"),
+                        dst_ip=alert.get("dst_ip"),
+                        pos_start=alert.get("pos_start"),
+                        pos_end=alert.get("pos_end"),
+                        payload_preview=pv,
+                        priority=priority,
+                        severity=severity,
+                    )
+                )
+            session.bulk_save_objects(models)
+            session.commit()
+        except Exception:
+            print("[alerter] failed to persist alert batch", flush=True)
+        finally:
+            try:
+                session.close()
+            except Exception:
+                pass
+
     def _broadcast(self, alert: Dict[str, Any]):
         # broadcast without short-time suppression
         try:
@@ -204,37 +252,55 @@ class Alerter:
 
     def _worker_loop(self):
         """后台工作线程：从队列中取出告警并执行持久化和广播。"""
+        buffer: list[Dict[str, Any]] = []
+        last_flush = time.time()
         while not self._stop_event.is_set():
             try:
                 alert = self._queue.get(timeout=0.5)
             except queue.Empty:
-                continue
+                alert = None
 
+            if alert is not None:
+                try:
+                    try:
+                        self._broadcast(alert)
+                    except Exception:
+                        logger.exception("Failed to broadcast alert")
+                    try:
+                        ALERTS_EMITTED.inc()
+                    except Exception:
+                        logger.exception("Failed to increment ALERTS_EMITTED")
+                    try:
+                        # 如果是行为分析告警，增加专门的计数器
+                        if alert.get("match_type") == "behavior":
+                            from app.metrics import BEHAVIOR_ALERTS_EMITTED
+                            BEHAVIOR_ALERTS_EMITTED.inc()
+                    except Exception:
+                        logger.exception("Failed to increment BEHAVIOR_ALERTS_EMITTED")
+                    buffer.append(alert)
+                finally:
+                    try:
+                        self._queue.task_done()
+                    except Exception:
+                        pass
+
+            now = time.time()
+            if buffer and (
+                len(buffer) >= self.batch_size
+                or now - last_flush >= self.batch_flush_interval
+            ):
+                try:
+                    self._persist_batch(buffer)
+                except Exception:
+                    logger.exception("Failed to persist alert batch")
+                buffer.clear()
+                last_flush = now
+
+        if buffer:
             try:
-                try:
-                    self._persist(alert)
-                except Exception:
-                    logger.exception("Failed to persist alert")
-                try:
-                    self._broadcast(alert)
-                except Exception:
-                    logger.exception("Failed to broadcast alert")
-                try:
-                    ALERTS_EMITTED.inc()
-                except Exception:
-                    logger.exception("Failed to increment ALERTS_EMITTED")
-                try:
-                    # 如果是行为分析告警，增加专门的计数器
-                    if alert.get("match_type") == "behavior":
-                        from app.metrics import BEHAVIOR_ALERTS_EMITTED
-                        BEHAVIOR_ALERTS_EMITTED.inc()
-                except Exception:
-                    logger.exception("Failed to increment BEHAVIOR_ALERTS_EMITTED")
-            finally:
-                try:
-                    self._queue.task_done()
-                except Exception:
-                    pass
+                self._persist_batch(buffer)
+            except Exception:
+                logger.exception("Failed to persist alert batch")
 
     def stop(self):
         """请求停止后台线程。"""

@@ -201,23 +201,138 @@ def match_payload(payload: bytes, protocol: str = "", dst_port: Optional[str] = 
     if not candidate_rule_ids:
         return []
 
-    # 2. 获取完整的匹配结果
-    all_matches = eng.match(payload)
+    candidate_rule_id_set = set(candidate_rule_ids)
 
-    # 3. 过滤出候选规则中的匹配结果
+    sticky_buffers = {}
+    try:
+        sticky_buffers = (packet_info or {}).get("sticky_buffers") or {}
+    except Exception:
+        sticky_buffers = {}
+
+    def _buffer_key_for_rule(rule_id: str) -> str:
+        try:
+            meta = eng._rule_meta.get(rule_id, {})
+            md = meta.get("metadata") or {}
+            if md.get("dns_query"):
+                return "dns_query"
+            if md.get("ftp_command"):
+                return "ftp_command"
+            if md.get("smtp_command"):
+                return "smtp_command"
+            if md.get("pop_command"):
+                return "pop_command"
+        except Exception:
+            pass
+        return "raw"
+
+    # 2. 按 buffer 做 AC 匹配（content），让 dns_query/ftp_command 等规则在语义字段上匹配而非原始 payload
+    group_map: Dict[str, set] = {}
+    for rid in candidate_rule_ids:
+        bk = _buffer_key_for_rule(rid)
+        if bk not in group_map:
+            group_map[bk] = set()
+        group_map[bk].add(rid)
+
+    all_matches = []
+    content_matched_rule_ids: set[str] = set()
+    for bk, rid_set in group_map.items():
+        buf = payload if bk == "raw" else sticky_buffers.get(bk, b"")
+        if not buf:
+            continue
+        matches, matched_ids = eng.match_content(buf, rid_set)
+        for m in matches:
+            try:
+                m["_buffer"] = bk
+            except Exception:
+                pass
+        all_matches.extend(matches)
+        try:
+            content_matched_rule_ids |= set(matched_ids)
+        except Exception:
+            pass
+
+    # 3. 过滤出候选规则中的匹配结果（content 命中）
     filtered_matches = []
     for match in all_matches:
         rule_id = match.get("rule_id")
-        if rule_id in candidate_rule_ids:
-            # 从规则元数据中添加消息
+        if not rule_id:
+            continue
+        if rule_id not in candidate_rule_id_set:
+            continue
+        bk = match.get("_buffer") or "raw"
+        buf = payload if bk == "raw" else sticky_buffers.get(bk, b"")
+        # 从规则元数据中添加消息
+        meta = eng._rule_meta.get(rule_id, {})
+        match["message"] = meta.get("description", "")
+        if "priority" in meta:
+            match["priority"] = meta.get("priority")
+        # 过滤高级选项（如 ip_proto/ttl/flags/icmp 等）
+        if not _match_advanced_filters(meta, packet_info, match.get("pos"), buf):
+            continue
+        metadata = meta.get("metadata") or {}
+        if not _match_content_patterns(buf, metadata):
+            continue
+        if metadata.get("content_patterns") and eng._pcre_map.get(rule_id):
+            if not _pcre_matches(buf, eng._pcre_map.get(rule_id, [])):
+                continue
+        # 如果规则包含 byte_test，则必须满足 byte_test 条件
+        byte_tests = meta.get("byte_tests") or (meta.get("metadata") or {}).get("byte_tests")
+        if byte_tests:
+            # byte_test 更接近“原始 payload 偏移语义”，这里仍对原始 payload 求值
+            if not _eval_byte_tests(payload, byte_tests):
+                continue
+        try:
+            match.pop("_buffer", None)
+        except Exception:
+            pass
+        filtered_matches.append(match)
+
+    # 4. 对 pcre-only 规则做匹配（无 content_patterns 的规则）
+    pcre_only_rule_ids = []
+    for rule_id in candidate_rule_ids:
+        if rule_id in content_matched_rule_ids:
+            continue
+        if rule_id not in eng._pcre_map:
+            continue
+        meta = eng._rule_meta.get(rule_id, {})
+        metadata = meta.get("metadata") or {}
+        if rule_id in eng._rules_with_content:
+            continue
+        pcre_only_rule_ids.append(rule_id)
+
+    # 对 pcre-only 规则也按 buffer 分组匹配（例如 dns_query + pcre）
+    pcre_group_map: Dict[str, List[str]] = {}
+    for rid in pcre_only_rule_ids:
+        bk = _buffer_key_for_rule(rid)
+        if bk not in pcre_group_map:
+            pcre_group_map[bk] = []
+        pcre_group_map[bk].append(rid)
+
+    for bk, rid_list in pcre_group_map.items():
+        buf = payload if bk == "raw" else sticky_buffers.get(bk, b"")
+        if not buf:
+            continue
+
+        # 先用 content_patterns 做一次廉价预筛，减少不必要的正则开销
+        rid_list_prefiltered = []
+        for rid in rid_list:
+            meta = eng._rule_meta.get(rid, {})
+            metadata = meta.get("metadata") or {}
+            if not _match_content_patterns(buf, metadata):
+                continue
+            rid_list_prefiltered.append(rid)
+
+        for match in eng.match_pcre(buf, rid_list_prefiltered):
+            rule_id = match.get("rule_id")
+            if not rule_id:
+                continue
             meta = eng._rule_meta.get(rule_id, {})
             match["message"] = meta.get("description", "")
             if "priority" in meta:
                 match["priority"] = meta.get("priority")
-            # 过滤高级选项（如 ip_proto/ttl/flags/icmp 等）
-            if not _match_advanced_filters(meta, packet_info, match.get("pos"), payload):
+            if not _match_advanced_filters(meta, packet_info, match.get("pos"), buf):
                 continue
-            # 如果规则包含 byte_test，则必须满足 byte_test 条件
+            metadata = meta.get("metadata") or {}
             byte_tests = meta.get("byte_tests") or (meta.get("metadata") or {}).get("byte_tests")
             if byte_tests:
                 if not _eval_byte_tests(payload, byte_tests):
@@ -232,6 +347,12 @@ def match_payload(payload: bytes, protocol: str = "", dst_port: Optional[str] = 
         meta = eng._rule_meta.get(rule_id, {})
         if not _match_advanced_filters(meta, packet_info, None, payload):
             continue
+        metadata = meta.get("metadata") or {}
+        if not _match_content_patterns(payload, metadata):
+            continue
+        if metadata.get("content_patterns") and eng._pcre_map.get(rule_id):
+            if not _pcre_matches(payload, eng._pcre_map.get(rule_id, [])):
+                continue
         byte_tests = meta.get("byte_tests") or (meta.get("metadata") or {}).get("byte_tests")
         byte_test_only = meta.get("byte_test_only") or (meta.get("metadata") or {}).get("byte_test_only")
         if not byte_tests:
@@ -304,6 +425,137 @@ def _eval_byte_tests(payload: bytes, byte_tests: List[Dict[str, Any]]) -> bool:
     return True
 
 
+def _match_content_patterns(payload: Optional[bytes], metadata: Dict[str, Any]) -> bool:
+    patterns = metadata.get("content_patterns") if isinstance(metadata, dict) else None
+    if not patterns:
+        return True
+    if payload is None:
+        return False
+
+    def _as_int(val: Any) -> Optional[int]:
+        if val is None:
+            return None
+        try:
+            return int(val)
+        except Exception:
+            return None
+
+    def _as_bool(val: Any) -> bool:
+        if isinstance(val, bool):
+            return val
+        if val is None:
+            return False
+        s = str(val).strip().lower()
+        return s in ("1", "true", "yes", "y", "on")
+
+    payload_bytes = payload or b""
+    global_nocase = bool(metadata.get("nocase"))
+
+    options = metadata.get("content_options")
+    options_list: Optional[list] = options if isinstance(options, list) else None
+
+    # 向后兼容：旧导入器可能把 offset/depth/within/distance 写在 metadata 顶层
+    # 仅在没有 content_options 时，将其应用到第一条 content。
+    if options_list is None:
+        legacy_any = any(metadata.get(k) is not None for k in ("offset", "depth", "within", "distance"))
+        if legacy_any:
+            options_list = [
+                {
+                    "offset": metadata.get("offset"),
+                    "depth": metadata.get("depth"),
+                    "within": metadata.get("within"),
+                    "distance": metadata.get("distance"),
+                    "nocase": metadata.get("nocase"),
+                }
+            ]
+
+    cursor_end = 0
+    for idx, pat in enumerate(patterns):
+        if not pat:
+            continue
+
+        pat_bytes = str(pat).encode("latin-1", errors="ignore")
+        if not pat_bytes:
+            continue
+
+        opt: Dict[str, Any] = {}
+        if options_list is not None and idx < len(options_list) and isinstance(options_list[idx], dict):
+            opt = options_list[idx]
+
+        nocase_this = global_nocase or _as_bool(opt.get("nocase"))
+        offset = _as_int(opt.get("offset"))
+        depth = _as_int(opt.get("depth"))
+        distance = _as_int(opt.get("distance"))
+        within = _as_int(opt.get("within"))
+
+        # 计算搜索窗口
+        if idx == 0:
+            start = max(0, offset or 0)
+        else:
+            start = cursor_end
+            if distance is not None and distance >= 0:
+                start = cursor_end + distance
+            if offset is not None and offset >= 0:
+                start = max(start, offset)
+
+        start = max(0, start)
+        end = len(payload_bytes)
+
+        # depth：限制搜索窗口长度（相对 offset 或 start）
+        if depth is not None and depth >= 0:
+            depth_base = offset if (offset is not None and offset >= 0) else start
+            end = min(end, depth_base + depth)
+
+        # within：限制匹配起点相对上一个匹配结束位置
+        if idx > 0 and within is not None and within >= 0:
+            max_start = cursor_end + within
+            end = min(end, max_start + len(pat_bytes))
+
+        if end < start:
+            return False
+        if start > len(payload_bytes):
+            return False
+
+        segment = payload_bytes[start:end]
+        if nocase_this:
+            pos = segment.lower().find(pat_bytes.lower())
+        else:
+            pos = segment.find(pat_bytes)
+        if pos < 0:
+            return False
+
+        match_start = start + pos
+        if idx > 0 and within is not None and within >= 0:
+            if match_start > cursor_end + within:
+                return False
+
+        cursor_end = match_start + len(pat_bytes)
+
+    return True
+
+
+def _pcre_matches(payload: Optional[bytes], regexes: List[Any]) -> bool:
+    if not regexes:
+        return True
+    try:
+        text = (payload or b"").decode("utf-8", errors="ignore")
+    except Exception:
+        text = ""
+
+    # Snort 语义：同一条规则中的多个 pcre 选项是 AND 关系。
+    # 即：必须全部匹配才算命中；单条规则内的 OR 应由正则自身用 '|' 表达。
+    any_valid = False
+    for rx in regexes:
+        try:
+            m = rx.search(text)
+            any_valid = True
+        except Exception:
+            return False
+        if not m:
+            return False
+    return any_valid
+
+
 def _parse_flow_tokens(flow_val: Any) -> List[str]:
     if flow_val is None:
         return []
@@ -332,6 +584,67 @@ def _match_advanced_filters(meta: Dict[str, Any], packet_info: Optional[Dict[str
         return True
 
     pkt = packet_info or {}
+
+    # dsize
+    # Snort 语义（简化支持）：
+    # - dsize:100
+    # - dsize:>100, >=100, <100, <=100
+    # - dsize:100<>200 (inclusive)
+    # - dsize:100-200 (inclusive)
+    # - dsize:!100 或 !>100（negate）
+    dsize_rule = metadata.get("dsize")
+    if dsize_rule is not None:
+        payload_len = len(payload) if payload is not None else 0
+        expr = str(dsize_rule).strip().replace(" ", "")
+        negate = False
+        if expr.startswith("!"):
+            negate = True
+            expr = expr[1:]
+
+        ok = True
+        try:
+            if "<>" in expr:
+                left, right = expr.split("<>", 1)
+                lo = int(left)
+                hi = int(right)
+                ok = lo <= payload_len <= hi
+            elif "-" in expr and expr.count("-") == 1 and not expr.startswith("-"):
+                left, right = expr.split("-", 1)
+                lo = int(left)
+                hi = int(right)
+                ok = lo <= payload_len <= hi
+            elif expr.startswith(">="):
+                ok = payload_len >= int(expr[2:])
+            elif expr.startswith("<="):
+                ok = payload_len <= int(expr[2:])
+            elif expr.startswith(">"):
+                ok = payload_len > int(expr[1:])
+            elif expr.startswith("<"):
+                ok = payload_len < int(expr[1:])
+            else:
+                ok = payload_len == int(expr)
+        except Exception:
+            return False
+
+        if negate:
+            ok = not ok
+        if not ok:
+            return False
+
+    # Sticky buffer / service hints（简化）：如果规则声明了特定协议缓冲区，则要求 packet_info.app_proto 匹配。
+    app_proto = (pkt.get("app_proto") or "").lower()
+    if metadata.get("dns_query"):
+        if app_proto != "dns":
+            return False
+    if metadata.get("ftp_command"):
+        if app_proto != "ftp":
+            return False
+    if metadata.get("smtp_command"):
+        if app_proto != "smtp":
+            return False
+    if metadata.get("pop_command"):
+        if app_proto != "pop3":
+            return False
 
     # ip_id
     if metadata.get("ip_id") is not None:
@@ -412,7 +725,9 @@ def _match_advanced_filters(meta: Dict[str, Any], packet_info: Optional[Dict[str
             dir_expected.add("to_client")
 
         if dir_expected:
-            if flow_dir is None or flow_dir not in dir_expected:
+            # 部分协议/场景下（例如 UDP）我们没有可靠的 flow 方向追踪。
+            # 若 flow_dir 缺失，则不因方向关键字直接判失败；有值时才严格校验。
+            if flow_dir is not None and flow_dir not in dir_expected:
                 return False
 
         if "only_stream" in flow_tokens:

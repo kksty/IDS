@@ -28,12 +28,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "开发流程.md",
+                "file": "4.4数据库设计.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "开发流程"
+              "title": "4.4数据库设计"
             }
           }
         ],
@@ -50,13 +50,13 @@
             "state": {
               "type": "outline",
               "state": {
-                "file": "开发流程.md",
+                "file": "4.4数据库设计.md",
                 "followCursor": false,
                 "showSearch": false,
                 "searchQuery": ""
               },
               "icon": "lucide-list",
-              "title": "开发流程 的大纲"
+              "title": "4.4数据库设计 的大纲"
             }
           }
         ]
@@ -209,9 +209,11 @@
   },
   "active": "bd03091dbcf2fabc",
   "lastOpenFiles": [
+    "4.5本章小结.md",
+    "程序工作原理图.md",
+    "开发流程.md",
     "性能优化指南.md",
     "开发阶段六：前端.md",
-    "开发流程.md",
     "开发阶段一：需求 & 设计.md",
     "OOTD.md",
     "log.md",

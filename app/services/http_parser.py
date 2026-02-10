@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
 import zlib
 
 _HAVE_HTTPT = False
@@ -94,12 +94,93 @@ class HttpRequestParser:
         })
 
 
+class HttpResponseParser:
+    """httptools 的响应回调接收器。"""
+
+    def __init__(self):
+        self.responses: List[Dict[str, Any]] = []
+        self._reset_message()
+
+    def _reset_message(self) -> None:
+        self.headers: Dict[str, str] = {}
+        self.status_text: str = ""
+        self.status_code: Optional[int] = None
+        self.version: str = ""
+        self.body_buffer = bytearray()
+
+    def on_message_begin(self):
+        self._reset_message()
+
+    def on_status(self, status: bytes):
+        try:
+            self.status_text = status.decode("utf-8", errors="ignore")
+        except Exception:
+            self.status_text = ""
+
+    def on_header(self, name: bytes, value: bytes):
+        try:
+            k = name.decode("utf-8", errors="ignore").strip().lower()
+            v = value.decode("utf-8", errors="ignore").strip()
+            if k:
+                self.headers[k] = v
+        except Exception:
+            pass
+
+    def on_headers_complete(self):
+        try:
+            self.version = f"HTTP/{self._parser.get_http_version()}"  # type: ignore[attr-defined]
+        except Exception:
+            self.version = ""
+        try:
+            self.status_code = int(self._parser.get_status_code())  # type: ignore[attr-defined]
+        except Exception:
+            self.status_code = None
+
+    def on_body(self, body: bytes):
+        self.body_buffer.extend(body)
+
+    def on_message_complete(self):
+        body = bytes(self.body_buffer)
+
+        try:
+            ce = (self.headers.get("content-encoding") or "").lower()
+            if "gzip" in ce or "deflate" in ce:
+                body = _decode_gzip(body)
+        except Exception:
+            pass
+
+        try:
+            status_code = "" if self.status_code is None else str(self.status_code)
+            status_line = f"{self.version} {status_code} {self.status_text}".strip().encode()
+            header_lines = [f"{k}: {v}".encode() for k, v in self.headers.items()]
+            raw = status_line + b"\r\n" + b"\r\n".join(header_lines) + b"\r\n\r\n" + body
+        except Exception:
+            raw = body
+
+        self.responses.append({
+            "version": self.version,
+            "status_code": self.status_code,
+            "status_text": self.status_text,
+            "headers": dict(self.headers),
+            "body": body,
+            "raw": raw,
+        })
+
+
 def extract_http_requests(buf: bytes) -> Tuple[List[Dict[str, Any]], int]:
     """Extract HTTP requests from buffer using httptools if available, else fallback."""
     if _HAVE_HTTPT:
         return _extract_http_requests_httptools(buf)
     else:
         return _extract_http_requests_fallback(buf)
+
+
+def extract_http_responses(buf: bytes) -> Tuple[List[Dict[str, Any]], int]:
+    """Extract HTTP responses from buffer using httptools if available, else fallback."""
+    if _HAVE_HTTPT:
+        return _extract_http_responses_httptools(buf)
+    else:
+        return _extract_http_responses_fallback(buf)
 
 
 def _extract_http_requests_httptools(buf: bytes) -> Tuple[List[Dict[str, Any]], int]:
@@ -127,6 +208,22 @@ def _extract_http_requests_httptools(buf: bytes) -> Tuple[List[Dict[str, Any]], 
         return [], 0
 
     return parser_obj.requests, len(buf)
+
+
+def _extract_http_responses_httptools(buf: bytes) -> Tuple[List[Dict[str, Any]], int]:
+    parser_obj = HttpResponseParser()
+    parser = httptools.HttpResponseParser(parser_obj)
+    parser_obj._parser = parser  # type: ignore[attr-defined]
+
+    try:
+        parser.feed_data(buf)
+    except Exception:
+        return _extract_http_responses_fallback(buf)
+
+    if not parser_obj.responses:
+        return [], 0
+
+    return parser_obj.responses, len(buf)
 
 
 def _extract_http_requests_fallback(buf: bytes) -> Tuple[List[Dict[str, Any]], int]:
@@ -205,6 +302,62 @@ def _extract_http_requests_fallback(buf: bytes) -> Tuple[List[Dict[str, Any]], i
         i = req_total_end
 
     return requests, i
+
+
+def _extract_http_responses_fallback(buf: bytes) -> Tuple[List[Dict[str, Any]], int]:
+    responses: List[Dict[str, Any]] = []
+    i = 0
+    total = len(buf)
+    while True:
+        if i >= total:
+            break
+        header_end = buf.find(b"\r\n\r\n", i)
+        if header_end == -1:
+            break
+        header_block = buf[i:header_end]
+        lines = header_block.split(b"\r\n")
+        if not lines:
+            i = header_end + 4
+            continue
+        status_line = lines[0].decode("utf-8", errors="ignore")
+        parts = status_line.split(" ")
+        if len(parts) < 2 or not parts[0].upper().startswith("HTTP/"):
+            i = header_end + 4
+            continue
+
+        version = parts[0]
+        status_code = None
+        try:
+            status_code = int(parts[1])
+        except Exception:
+            status_code = None
+        status_text = " ".join(parts[2:]) if len(parts) > 2 else ""
+
+        headers = _parse_headers(header_block)
+        content_length = 0
+        if "content-length" in headers:
+            try:
+                content_length = int(headers["content-length"])
+            except Exception:
+                content_length = 0
+
+        resp_total_end = header_end + 4 + content_length
+        if total < resp_total_end:
+            break
+
+        body = buf[header_end + 4:resp_total_end]
+        raw = buf[i:resp_total_end]
+        responses.append({
+            "version": version,
+            "status_code": status_code,
+            "status_text": status_text,
+            "headers": headers,
+            "body": body,
+            "raw": raw,
+        })
+        i = resp_total_end
+
+    return responses, i
 
 
 def _parse_headers(header_bytes: bytes) -> Dict[str, str]:

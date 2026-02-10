@@ -4,6 +4,7 @@ import asyncio
 import logging
 import threading
 import time
+import queue
 from typing import Optional, Callable, Coroutine, Any
 
 from scapy.all import sniff
@@ -11,9 +12,9 @@ from scapy.layers.inet import IP, TCP, UDP, ICMP
 from scapy.utils import PcapReader
 
 from app.services.detection import ContextManager
-from app.services.http_parser import extract_http_requests
+from app.services.http_parser import extract_http_requests, extract_http_responses
 from app.services.reassembly_adapter import FlowReassemblerManager
-from app.services.behavior_analyzer import BehaviorAnalyzer, BehaviorAlert
+from app.services.behavior_analyzer import get_behavior_analyzer, BehaviorAlert
 from app.services.protocol_parser import parse_packet_for_protocol
 
 logger = logging.getLogger("ids.sniffer")
@@ -33,7 +34,8 @@ class SnifferManager:
 
         self.context_manager = ContextManager(timeout=context_timeout)
         self.reassembly_manager = FlowReassemblerManager(max_buffer=max_buffer)
-        self.behavior_analyzer = BehaviorAnalyzer()
+        # 使用全局行为分析器实例，确保与规则告警的关联抑制共享同一状态。
+        self.behavior_analyzer = get_behavior_analyzer()
 
         # TCP flow state for flow keyword matching
         self._tcp_flow_states = {}
@@ -50,6 +52,13 @@ class SnifferManager:
         self._stop_event = threading.Event()
         self._sniffing_active = False
 
+        # 解耦：嗅探回调只入队，worker 后台处理，避免高流量下阻塞 scapy 回调导致丢包。
+        from app.config import config
+        self._queue: "queue.Queue" = queue.Queue(maxsize=max(1, int(getattr(config, "SNIFFER_QUEUE_SIZE", 5000))))
+        self._workers: list[threading.Thread] = []
+        self._worker_stop = threading.Event()
+        self._worker_count = max(1, int(getattr(config, "SNIFFER_WORKERS", 2)))
+
     def set_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         """设置事件循环引用，供内部告警广播使用。"""
         self.loop = loop
@@ -58,7 +67,91 @@ class SnifferManager:
         """停止嗅探管理器"""
         self._stop_event.set()
         self._sniffing_active = False
+        self._worker_stop.set()
         logger.info("SnifferManager stopped")
+
+    def start_workers(self) -> None:
+        """启动后台处理 worker（幂等）。"""
+        if self._workers:
+            return
+
+        self._worker_stop.clear()
+
+        for i in range(self._worker_count):
+            t = threading.Thread(target=self._worker_loop, name=f"PacketWorker-{i}", daemon=True)
+            self._workers.append(t)
+            t.start()
+
+    def join_workers(self, timeout: float = 1.0) -> None:
+        """等待 worker 退出（尽量而为）。"""
+        for t in list(self._workers):
+            try:
+                t.join(timeout=timeout)
+            except Exception:
+                pass
+        self._workers = []
+
+    def enqueue_packet(self, packet, broadcast_callable: Callable[[dict], Coroutine[Any, Any, Any]]) -> None:
+        """嗅探回调入口：尽快返回，避免阻塞抓包线程。"""
+        if self._stop_event.is_set() or self._worker_stop.is_set():
+            return
+        try:
+            self._broadcast_callable = broadcast_callable
+        except Exception:
+            pass
+
+        from app.metrics import SNIFFER_QUEUE_DEPTH, SNIFFER_ENQUEUED, SNIFFER_DROPPED
+
+        try:
+            self._queue.put_nowait(packet)
+            SNIFFER_ENQUEUED.inc()
+        except queue.Full:
+            SNIFFER_DROPPED.inc()
+            return
+        except Exception:
+            SNIFFER_DROPPED.inc()
+            return
+        finally:
+            try:
+                SNIFFER_QUEUE_DEPTH.set(self._queue.qsize())
+            except Exception:
+                pass
+
+    def _worker_loop(self) -> None:
+        from app.metrics import SNIFFER_QUEUE_DEPTH, PACKET_PROCESSING_SECONDS
+
+        while not self._worker_stop.is_set() and not self._stop_event.is_set():
+            try:
+                packet = self._queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            except Exception:
+                continue
+
+            try:
+                try:
+                    SNIFFER_QUEUE_DEPTH.set(self._queue.qsize())
+                except Exception:
+                    pass
+
+                bc = getattr(self, "_broadcast_callable", None)
+                if bc is None:
+                    # 在线模式应该总有 bc；这里兜底
+                    bc = _get_default_broadcast_callable()
+
+                start = time.time()
+                try:
+                    self.process_packet(packet, bc)
+                finally:
+                    try:
+                        PACKET_PROCESSING_SECONDS.observe(max(0.0, time.time() - start))
+                    except Exception:
+                        pass
+            finally:
+                try:
+                    self._queue.task_done()
+                except Exception:
+                    pass
 
     def is_active(self) -> bool:
         """检查是否正在活动"""
@@ -103,6 +196,59 @@ class SnifferManager:
             return True
 
         return False
+
+    def _is_tls_record(self, payload: bytes) -> bool:
+        """粗略判断是否为 TLS 记录（用于跳过 HTTPS 密文匹配）。"""
+        if not payload or len(payload) < 5:
+            return False
+        content_type = payload[0]
+        # TLS record types: 0x14 change_cipher_spec, 0x15 alert, 0x16 handshake, 0x17 application_data
+        if content_type not in (0x14, 0x15, 0x16, 0x17):
+            return False
+        # TLS version 0x0300-0x0304
+        if payload[1] != 0x03:
+            return False
+        if payload[2] > 0x04:
+            return False
+        return True
+
+    def _guess_app_proto(self, l4_proto: str, sport: Any, dport: Any, payload: bytes) -> Optional[str]:
+        """尽量轻量地猜测应用层协议，用于 Snort sticky buffer 语义过滤等。"""
+        try:
+            sp = int(sport)
+        except Exception:
+            sp = None
+        try:
+            dp = int(dport)
+        except Exception:
+            dp = None
+
+        proto = (l4_proto or "").upper()
+
+        # TCP: TLS / HTTP
+        if proto == "TCP":
+            if self._is_tls_record(payload or b""):
+                return "tls"
+            if self._is_likely_http_payload(payload or b""):
+                return "http"
+
+        # 基于常见端口的轻量识别（TCP/UDP）
+        ports = {p for p in (sp, dp) if isinstance(p, int)}
+        if 53 in ports:
+            return "dns"
+        if 22 in ports:
+            return "ssh"
+        if 21 in ports or 20 in ports:
+            return "ftp"
+        if 25 in ports or 587 in ports or 465 in ports:
+            return "smtp"
+        if 110 in ports or 995 in ports:
+            return "pop3"
+        if 143 in ports or 993 in ports:
+            return "imap"
+        if 23 in ports:
+            return "telnet"
+        return None
 
     def _flow_key(self, src_ip: str, src_port: Any, dst_ip: str, dst_port: Any) -> str:
         """生成与方向无关的 flow key（TCP only）。"""
@@ -323,6 +469,7 @@ class SnifferManager:
             "window": None,
             "icmp_type": None,
             "icmp_code": None,
+            "app_proto": None,
         }
 
         # 如果 pypcapkit 未能识别协议或未启用，回退到 scapy 基于协议层的判定
@@ -351,7 +498,96 @@ class SnifferManager:
             except Exception:
                 proto = ""
 
+        # 将真实 payload 送入行为分析（EWMA 流量突增、会话速率、端口扫描等）。
+        # 注意：行为分析依赖 src/dst/ports/payload_size，因此在解析出 proto 与端口后执行。
+        try:
+            if proto in ("TCP", "UDP"):
+                try:
+                    src_port_i = int(sport)
+                except Exception:
+                    src_port_i = 0
+                try:
+                    dst_port_i = int(dport)
+                except Exception:
+                    dst_port_i = 0
+            else:
+                src_port_i = 0
+                dst_port_i = 0
+
+            self.behavior_analyzer.analyze_packet(
+                {
+                    "src_ip": src_ip,
+                    "dst_ip": dst_ip,
+                    "src_port": src_port_i,
+                    "dst_port": dst_port_i,
+                    "protocol": proto or "unknown",
+                    "payload": payload or b"",
+                }
+            )
+        except Exception:
+            logger.exception("Behavior analysis failed")
+
         # 若无法识别 L4 协议则保持为空（仅做基础匹配）
+
+        skip_raw_match = False
+
+        # 标记应用层协议（轻量）；用于引擎侧做 sticky buffer / service 过滤，减少误报。
+        try:
+            packet_info["app_proto"] = self._guess_app_proto(proto or "", sport, dport, payload or b"")
+        except Exception:
+            packet_info["app_proto"] = None
+
+        # 协议语义化缓冲区：为 Snort sticky buffer 类规则提供可匹配的“字段载体”。
+        # 例如 dns_query/ftp_command 等，不再只是过滤，而是可精确匹配字段文本。
+        sticky_buffers: dict[str, bytes] = {}
+        try:
+            app_proto = (packet_info.get("app_proto") or "").lower()
+            if app_proto in ("dns", "ftp", "smtp", "pop3") and proto in ("TCP", "UDP"):
+                try:
+                    src_port_i = int(sport)
+                except Exception:
+                    src_port_i = 0
+                try:
+                    dst_port_i = int(dport)
+                except Exception:
+                    dst_port_i = 0
+
+                parsed = parse_packet_for_protocol(src_ip, dst_ip, src_port_i, dst_port_i, payload or b"", proto)
+                if parsed and isinstance(getattr(parsed, "parsed_data", None), dict):
+                    pd = parsed.parsed_data
+                    if (parsed.protocol or "").lower() == "dns":
+                        domain = pd.get("domain")
+                        rtype = pd.get("record_type")
+                        parts = []
+                        if domain:
+                            parts.append(str(domain))
+                        if rtype:
+                            parts.append(str(rtype))
+                        if parts:
+                            sticky_buffers["dns_query"] = ("\n".join(parts)).encode("utf-8", errors="ignore")
+                    elif (parsed.protocol or "").lower() == "ftp":
+                        cmds = pd.get("commands") or []
+                        if isinstance(cmds, list) and cmds:
+                            sticky_buffers["ftp_command"] = ("\n".join([str(x) for x in cmds if x is not None])).encode(
+                                "utf-8", errors="ignore"
+                            )
+                    elif (parsed.protocol or "").lower() == "smtp":
+                        cmds = pd.get("commands") or []
+                        if isinstance(cmds, list) and cmds:
+                            sticky_buffers["smtp_command"] = ("\n".join([str(x) for x in cmds if x is not None])).encode(
+                                "utf-8", errors="ignore"
+                            )
+                    elif (parsed.protocol or "").lower() == "pop3":
+                        cmds = pd.get("commands") or []
+                        if isinstance(cmds, list) and cmds:
+                            sticky_buffers["pop_command"] = ("\n".join([str(x) for x in cmds if x is not None])).encode(
+                                "utf-8", errors="ignore"
+                            )
+        except Exception:
+            sticky_buffers = {}
+
+        if sticky_buffers:
+            packet_info["sticky_buffers"] = sticky_buffers
 
         if proto == "TCP":
             # extract seq if available
@@ -387,11 +623,14 @@ class SnifferManager:
             # 语义事件提取依赖 TCP 重组结果 ready（下方单次重组得到）。
             # --- end semantic events ---
 
-            # 行为分析：记录连接信息
-            self.behavior_analyzer.track_connection(src_ip, dst_ip, sport, dport, proto)
+            # Skip TLS records (HTTPS) to avoid false positives from encrypted data
+            if self._is_tls_record(payload):
+                return
 
             # Quick HTTP detection before expensive stream reassembly
             is_likely_http = self._is_likely_http_payload(payload)
+            if is_likely_http:
+                skip_raw_match = True
 
             # 为 HTTP 流维护轻量级上下文（主要用于去重元数据等）
             ctx = None
@@ -413,6 +652,10 @@ class SnifferManager:
                 # best-effort: append raw payload to context buffer and attempt HTTP extraction
                 ctx.append(payload)
                 ready = ctx.get_buffer()
+
+            if not is_likely_http and ready and self._is_likely_http_payload(ready):
+                is_likely_http = True
+                skip_raw_match = True
 
             # --- Semantic auth extraction (consume ready once) ---
             try:
@@ -492,8 +735,10 @@ class SnifferManager:
                 logger.debug("Semantic auth extraction failed", exc_info=True)
 
             if ready and is_likely_http and ctx is not None:
-                # 尝试提取 HTTP 请求
-                requests, consumed = extract_http_requests(ready)
+                # 尝试提取 HTTP 请求/响应
+                requests, consumed_req = extract_http_requests(ready)
+                responses, consumed_res = extract_http_responses(ready)
+                consumed = max(consumed_req, consumed_res)
                 if consumed and seq is None:
                     # 如果来自本地 ctx.buffer（fallback），移除已消费字节
                     try:
@@ -501,7 +746,7 @@ class SnifferManager:
                     except Exception:
                         ctx.clear()
 
-                # 对每个完整请求做匹配（只匹配请求方向，忽略 response）
+                # 对每个完整请求做匹配（仅在 HTTP 字段内匹配）
                 for req in requests:
                     # 对提取的请求原始字节计算一个短哈希值以避免处理两次提取相同的请求（如lo重复捕获等）
                     try:
@@ -525,9 +770,44 @@ class SnifferManager:
                             seen_hashes[req_hash] = now_ts
                     except Exception:
                         pass
-                    # 把 path 与 body 一并作为匹配载体
+                    # 把 path 与 body 一并作为匹配载体（包含 URL 解码后的内容）
                     try:
-                        match_payload_src = req.get("path", "").encode("utf-8", errors="ignore") + b" " + req.get("body", b"")
+                        from urllib.parse import unquote_plus
+
+                        headers = req.get("headers") or {}
+                        header_bytes = b"\r\n".join(
+                            [
+                                f"{k}: {v}".encode("utf-8", errors="ignore")
+                                for k, v in headers.items()
+                            ]
+                        )
+
+                        path_raw = req.get("path") or ""
+                        path_decoded = unquote_plus(path_raw)
+
+                        body_raw = req.get("body") or b""
+                        body_text = body_raw.decode("utf-8", errors="ignore")
+                        body_decoded = body_text
+                        content_type = (headers.get("content-type") or "").lower()
+                        if "application/x-www-form-urlencoded" in content_type:
+                            body_decoded = unquote_plus(body_text)
+
+                        base = f"{req.get('method') or ''} {path_raw} {req.get('version') or ''}".encode(
+                            "utf-8", errors="ignore"
+                        )
+                        decoded_blob = f"{path_decoded}\n{body_decoded}".encode(
+                            "utf-8", errors="ignore"
+                        )
+
+                        match_payload_src = (
+                            base
+                            + b"\r\n"
+                            + header_bytes
+                            + b"\r\n\r\n"
+                            + body_raw
+                            + b"\n\n"
+                            + decoded_blob
+                        )
                     except Exception:
                         match_payload_src = req.get("raw", b"")
 
@@ -613,12 +893,82 @@ class SnifferManager:
                             except Exception:
                                 logger.exception("[!] Alerter failed to handle alert")
 
+                # 对每个完整响应做匹配（仅匹配响应行，避免 TLS/乱码误报）
+                for resp in responses:
+                    try:
+                        status_code = resp.get("status_code")
+                        status_text = resp.get("status_text") or ""
+                        version = resp.get("version") or "HTTP/"
+                        status_line = f"{version} {status_code or ''} {status_text}".strip().encode(
+                            "utf-8", errors="ignore"
+                        )
+                        match_payload_src = status_line
+                    except Exception:
+                        match_payload_src = resp.get("raw", b"")
+
+                    from app.services.engine import match_payload
+                    from app.services.alerter import get_alerter
+                    from app.metrics import MATCHES_FOUND, PACKETS_PROCESSED
+
+                    PACKETS_PROCESSED.inc()
+
+                    packet_info_stream = dict(packet_info)
+                    packet_info_stream["stream"] = True
+                    matches = match_payload(
+                        match_payload_src,
+                        "TCP",
+                        str(dport),
+                        src_ip,
+                        str(sport),
+                        dst_ip,
+                        packet_info_stream,
+                    )
+                    if matches:
+                        try:
+                            MATCHES_FOUND.inc(len(matches))
+                        except Exception:
+                            pass
+                        alerter = get_alerter(broadcast_callable, self.loop)
+                        seen = set()
+                        for m in matches:
+                            rid = m.get("rule_id")
+                            if rid in seen:
+                                continue
+                            seen.add(rid)
+                            packet_summary = f"HTTP {src_ip}:{sport} -> {dst_ip} {status_code or ''}".strip()
+                            priority = m.get("priority")
+                            alert_data = {
+                                "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
+                                "protocol": proto,
+                                "src_ip": src_ip,
+                                "dst_ip": dst_ip,
+                                "packet_summary": packet_summary,
+                                "match_rule": rid,
+                                "match_text": m.get("match"),
+                                "match_type": m.get("type"),
+                                "payload_preview": status_line.decode("utf-8", errors="ignore") or packet_summary,
+                                "match_context": m.get("context", {}),
+                                "priority": priority,
+                                "severity": self._priority_to_severity(priority),
+                            }
+                            try:
+                                alerter.handle_alert(alert_data)
+                                from app.services.behavior_analyzer import get_behavior_analyzer
+                                b_analyzer = get_behavior_analyzer()
+                                b_analyzer.record_rule_alert(rid, src_ip, dst_ip)
+
+                                from app.services.correlation_engine import get_correlation_engine
+                                corr_engine = get_correlation_engine()
+                                corr_engine.add_alert(src_ip, rid, is_behavior=False)
+                            except Exception:
+                                logger.exception("[!] Alerter failed to handle alert")
+
             # done processing HTTP requests for this packet
             # Continue to process non-HTTP TCP/UDP payloads for pattern matching
             pass
 
         # Process all TCP/UDP payloads for pattern matching (including non-HTTP traffic)
-        if proto in ("TCP", "UDP") and payload:
+        if proto in ("TCP", "UDP") and payload and not (proto == "TCP" and skip_raw_match):
             # UDP 不做重组/HTTP 抽取：保持 datagram 语义，仅对 payload 做规则匹配。
 
             # 统一去重窗口：同一 (rule_id + flow) 在窗口内只报一次。
@@ -902,13 +1252,15 @@ def _get_default_broadcast_callable() -> Callable[[dict], Coroutine[Any, Any, An
 
 
 def _packet_callback_factory(loop: asyncio.AbstractEventLoop,
-                           broadcast_callable: Callable[[dict], Coroutine[Any, Any, Any]],
-                           manager: SnifferManager):
+                             broadcast_callable: Callable[[dict], Coroutine[Any, Any, Any]],
+                             manager: SnifferManager):
     """创建数据包回调函数"""
     def _packet_callback(packet):
-        manager.process_packet(packet, broadcast_callable)
+        manager.enqueue_packet(packet, broadcast_callable)
 
     return _packet_callback
+
+
 def start_sniffing(interface: Optional[str] = None,
                   loop: Optional[asyncio.AbstractEventLoop] = None,
                   broadcast_callable: Optional[Callable[[dict], Coroutine[Any, Any, Any]]] = None,
@@ -940,17 +1292,32 @@ def start_sniffing(interface: Optional[str] = None,
     # 设置活动标志
     manager._sniffing_active = True
 
+    # 启动后台 worker
+    try:
+        manager.start_workers()
+    except Exception:
+        logger.exception("Failed to start packet workers")
+
     logger.info(f"Sniffer active on {interface or 'default'}. Filter: IP")
     try:
+        from app.config import config
+        bpf = config.BPF_FILTER or "ip"
+        logger.info(f"Using BPF filter: {bpf}")
         sniff(
             iface=interface,
             prn=_packet_callback_factory(loop, broadcast_callable, manager),
-            filter="ip",
+            filter=bpf,
             store=0,
             promisc=True,
+            stop_filter=lambda _p: bool(manager._stop_event.is_set()),
         )
     finally:
         manager._sniffing_active = False
+        try:
+            manager._worker_stop.set()
+            manager.join_workers(timeout=1.0)
+        except Exception:
+            logger.exception("Failed to stop packet workers")
 
 
 def process_pcap(
@@ -959,6 +1326,8 @@ def process_pcap(
     manager: Optional[SnifferManager] = None,
     broadcast_callable: Optional[Callable[[dict], Coroutine[Any, Any, Any]]] = None,
     max_packets: Optional[int] = None,
+    progress_callback: Optional[Callable[[int, float, float], None]] = None,
+    stop_event: Optional[threading.Event] = None,
 ) -> int:
     """离线 PCAP 分析入口。
 
@@ -993,11 +1362,35 @@ def process_pcap(
         broadcast_callable = _noop_broadcast
 
     count = 0
+    start_ts = time.time()
+    last_log_ts = start_ts
+    last_log_count = 0
+    log_interval_sec = 5.0
+    log_interval_pkts = 1000
     try:
         with PcapReader(pcap_path) as reader:
             for pkt in reader:
+                if stop_event is not None and stop_event.is_set():
+                    break
                 manager.process_packet(pkt, broadcast_callable)
                 count += 1
+                if count % log_interval_pkts == 0:
+                    now = time.time()
+                    delta_t = max(now - last_log_ts, 1e-6)
+                    delta_n = count - last_log_count
+                    rate = delta_n / delta_t
+                    logger.info(
+                        "PCAP progress: %d packets processed (%.1f pkt/s)",
+                        count,
+                        rate,
+                    )
+                    if progress_callback:
+                        try:
+                            progress_callback(count, rate, now - start_ts)
+                        except Exception:
+                            logger.debug("PCAP progress callback failed", exc_info=True)
+                    last_log_ts = now
+                    last_log_count = count
                 if max_packets is not None and count >= max_packets:
                     break
     except FileNotFoundError:
@@ -1005,5 +1398,17 @@ def process_pcap(
     except Exception:
         logger.exception("Error while processing PCAP file: %s", pcap_path)
 
-    logger.info("Processed %d packets from PCAP %s", count, pcap_path)
+    total_time = max(time.time() - start_ts, 1e-6)
+    if progress_callback:
+        try:
+            progress_callback(count, count / total_time, total_time)
+        except Exception:
+            logger.debug("PCAP progress callback failed", exc_info=True)
+    logger.info(
+        "Processed %d packets from PCAP %s in %.2fs (avg %.1f pkt/s)",
+        count,
+        pcap_path,
+        total_time,
+        count / total_time,
+    )
     return count

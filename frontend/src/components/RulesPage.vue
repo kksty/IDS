@@ -91,6 +91,8 @@
         v-loading="loading"
         @selection-change="handleSelectionChange"
         ref="rulesTableRef"
+        row-key="rule_id"
+        :reserve-selection="true"
       >
         <el-table-column type="selection" width="55" align="center" />
         <el-table-column
@@ -483,6 +485,17 @@
               </el-form-item>
             </el-col>
           </el-row>
+
+          <el-row :gutter="20">
+            <el-col :span="24">
+              <el-form-item label="标签">
+                <el-input
+                  v-model="ruleForm.tags_str"
+                  placeholder="可选，多个用逗号分隔，如: malware, backdoor"
+                />
+              </el-form-item>
+            </el-col>
+          </el-row>
         </el-card>
 
         <!-- 网络匹配 -->
@@ -592,6 +605,10 @@
             class="content-match-alert"
           />
 
+          <el-form-item label="nocase" class="pattern-form-item">
+            <el-checkbox v-model="ruleForm.nocase">忽略大小写</el-checkbox>
+          </el-form-item>
+
           <div
             v-for="(pattern, index) in ruleForm.patterns"
             :key="index"
@@ -644,6 +661,55 @@
                   </el-form-item>
                 </el-col>
               </el-row>
+
+              <el-row :gutter="20" v-if="pattern.match_type !== 'regex'">
+                <el-col :span="6">
+                  <el-form-item label="offset" class="pattern-form-item">
+                    <el-input
+                      v-model.number="pattern.offset"
+                      type="number"
+                      placeholder="可选"
+                    />
+                  </el-form-item>
+                </el-col>
+                <el-col :span="6">
+                  <el-form-item label="depth" class="pattern-form-item">
+                    <el-input
+                      v-model.number="pattern.depth"
+                      type="number"
+                      placeholder="可选"
+                    />
+                  </el-form-item>
+                </el-col>
+                <el-col :span="6">
+                  <el-form-item label="distance" class="pattern-form-item">
+                    <el-input
+                      v-model.number="pattern.distance"
+                      type="number"
+                      placeholder="可选"
+                    />
+                  </el-form-item>
+                </el-col>
+                <el-col :span="6">
+                  <el-form-item label="within" class="pattern-form-item">
+                    <el-input
+                      v-model.number="pattern.within"
+                      type="number"
+                      placeholder="可选"
+                    />
+                  </el-form-item>
+                </el-col>
+              </el-row>
+
+              <el-form-item
+                label="nocase"
+                class="pattern-form-item"
+                v-if="pattern.match_type !== 'regex'"
+              >
+                <el-checkbox v-model="pattern.nocase"
+                  >该条件忽略大小写</el-checkbox
+                >
+              </el-form-item>
             </el-card>
           </div>
 
@@ -1271,6 +1337,7 @@ export default {
       protocol: null,
       classtype: "",
       rev: null,
+      tags_str: "",
       src: "any",
       dst: "any",
       src_ports_str: "any",
@@ -1282,6 +1349,11 @@ export default {
         {
           content: "",
           match_type: "string",
+          offset: null,
+          depth: null,
+          distance: null,
+          within: null,
+          nocase: false,
         },
       ],
       // byte_test 规则
@@ -1302,6 +1374,7 @@ export default {
       flags: "",
       ip_id: null,
       ip_proto: null,
+      nocase: false,
     });
 
     const ruleFormRef = ref(null);
@@ -1313,6 +1386,7 @@ export default {
     const selectAllMode = ref(false); // 是否处于全选模式
     const allSelectedRuleIds = ref([]); // 所有选中的规则ID（包括不在当前页的）
     const excludedRules = ref([]); // 在全选模式下被取消勾选的规则ID
+    const suppressSelectionChange = ref(false);
 
     // Snort变量配置
     const snortVariables = ref([]);
@@ -1425,6 +1499,54 @@ export default {
         });
       });
       return { list, errors };
+    };
+
+    const parsePorts = (text) => {
+      if (!text || !String(text).trim()) {
+        return [];
+      }
+      const parts = String(text)
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const out = [];
+
+      parts.forEach((part) => {
+        const isNegated = part.startsWith("!");
+        const raw = isNegated ? part.slice(1) : part;
+
+        if (raw.includes(":")) {
+          const [startStr, endStr] = raw.split(":");
+          const start = Number(startStr);
+          const end = endStr === "" ? 65535 : Number(endStr);
+          if (!Number.isNaN(start) && !Number.isNaN(end) && start >= 0) {
+            if (isNegated) {
+              out.push(`!${start}:${endStr === "" ? "" : end}`);
+            } else {
+              for (let p = start; p <= end; p += 1) {
+                out.push(String(p));
+              }
+            }
+            return;
+          }
+        }
+
+        if (raw) {
+          out.push(isNegated ? `!${raw}` : raw);
+        }
+      });
+
+      return out;
+    };
+
+    const parseTags = (text) => {
+      if (!text || !String(text).trim()) {
+        return [];
+      }
+      return String(text)
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
     };
 
     const formatIsdataat = (list) => {
@@ -1547,6 +1669,10 @@ export default {
       return null;
     };
 
+    const escapeRegex = (value) => {
+      return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    };
+
     const getByteTestIssues = (bt) => {
       const issues = [];
       const valueEmpty =
@@ -1591,21 +1717,35 @@ export default {
         const response = await fetch(`${apiBase}/api/rules/?${params}`);
         if (response.ok) {
           const data = await response.json();
+          // Element Plus 在 data 替换时可能会触发 selection-change([])
+          // 在全选模式下需要忽略这些“非用户操作”的事件，避免误把整页加入 excludedRules。
+          if (selectAllMode.value) {
+            suppressSelectionChange.value = true;
+          }
           rules.value = data.rules;
           totalRules.value = data.total;
 
           if (selectAllMode.value) {
             nextTick(() => {
-              rules.value.forEach((rule) => {
+              const rows = Array.isArray(filteredRules.value)
+                ? filteredRules.value
+                : rules.value;
+              rulesTableRef.value?.clearSelection();
+              rows.forEach((rule) => {
                 const shouldSelect = !excludedRules.value.includes(
                   rule.rule_id,
                 );
                 rulesTableRef.value?.toggleRowSelection(rule, shouldSelect);
               });
-              selectedRules.value = rules.value.filter(
+              selectedRules.value = rows.filter(
                 (rule) => !excludedRules.value.includes(rule.rule_id),
               );
+              nextTick(() => {
+                suppressSelectionChange.value = false;
+              });
             });
+          } else {
+            suppressSelectionChange.value = false;
           }
         } else {
           ElMessage.error("加载规则失败");
@@ -1646,6 +1786,9 @@ export default {
     const editRule = (rule) => {
       // 复制规则数据到表单
       const metadata = rule.metadata || {};
+      const contentOptions = Array.isArray(metadata.content_options)
+        ? metadata.content_options
+        : [];
       Object.assign(ruleForm, {
         rule_id: rule.rule_id,
         name: rule.name,
@@ -1653,6 +1796,7 @@ export default {
         protocol: rule.protocol,
         classtype: metadata.classtype || "",
         rev: metadata.snort_rev || metadata.rev || null,
+        tags_str: Array.isArray(rule.tags) ? rule.tags.join(",") : "",
         src: rule.src,
         dst: rule.dst,
         src_ports_str: rule.src_ports ? rule.src_ports.join(",") : "any",
@@ -1665,6 +1809,7 @@ export default {
         flags: metadata.flags || "",
         ip_id: metadata.ip_id || null,
         ip_proto: metadata.ip_proto || null,
+        nocase: !!metadata.nocase,
       });
 
       ruleForm.byte_tests = Array.isArray(metadata.byte_tests)
@@ -1698,13 +1843,76 @@ export default {
           {
             content: "",
             match_type: "string",
+            offset: null,
+            depth: null,
+            distance: null,
+            within: null,
+            nocase: false,
           },
         ];
+      } else if (
+        rule.pattern_type === "pcre" &&
+        Array.isArray(metadata.content_patterns)
+      ) {
+        const regexPatterns = Array.isArray(rule.pattern)
+          ? rule.pattern
+          : rule.pattern
+            ? [rule.pattern]
+            : [];
+        const contentPatterns = metadata.content_patterns || [];
+        ruleForm.patterns = [
+          ...contentPatterns.map((content, idx) => {
+            const opt =
+              idx < contentOptions.length && contentOptions[idx]
+                ? contentOptions[idx]
+                : {};
+            return {
+              content,
+              match_type: "string",
+              offset: opt.offset ?? null,
+              depth: opt.depth ?? null,
+              distance: opt.distance ?? null,
+              within: opt.within ?? null,
+              nocase: !!opt.nocase,
+            };
+          }),
+          ...regexPatterns.map((content) => ({
+            content,
+            match_type: "regex",
+            offset: null,
+            depth: null,
+            distance: null,
+            within: null,
+            nocase: false,
+          })),
+        ];
+      } else if (Array.isArray(metadata.content_patterns)) {
+        const contentPatterns = metadata.content_patterns || [];
+        ruleForm.patterns = contentPatterns.map((content, idx) => {
+          const opt =
+            idx < contentOptions.length && contentOptions[idx]
+              ? contentOptions[idx]
+              : {};
+          return {
+            content,
+            match_type: "string",
+            offset: opt.offset ?? null,
+            depth: opt.depth ?? null,
+            distance: opt.distance ?? null,
+            within: opt.within ?? null,
+            nocase: !!opt.nocase,
+          };
+        });
       } else if (rule.pattern && Array.isArray(rule.pattern)) {
-        ruleForm.patterns = rule.pattern.map((content, index) => {
+        ruleForm.patterns = rule.pattern.map((content) => {
           return {
             content: content,
             match_type: rule.pattern_type === "pcre" ? "regex" : "string",
+            offset: null,
+            depth: null,
+            distance: null,
+            within: null,
+            nocase: false,
           };
         });
       } else if (rule.pattern) {
@@ -1712,6 +1920,11 @@ export default {
           {
             content: rule.pattern,
             match_type: rule.pattern_type === "pcre" ? "regex" : "string",
+            offset: null,
+            depth: null,
+            distance: null,
+            within: null,
+            nocase: false,
           },
         ];
       } else {
@@ -1719,6 +1932,11 @@ export default {
           {
             content: "",
             match_type: "string",
+            offset: null,
+            depth: null,
+            distance: null,
+            within: null,
+            nocase: false,
           },
         ];
       }
@@ -1759,13 +1977,19 @@ export default {
 
     // 选择变化处理
     const handleSelectionChange = (selection) => {
+      if (suppressSelectionChange.value) {
+        return;
+      }
       if (!selectAllMode.value) {
         selectedRules.value = selection;
       } else {
         // 在全选模式下，维护排除列表
         selectedRules.value = selection;
         // 更新排除列表：当前页面中未被选中的规则ID
-        const currentPageRuleIds = rules.value.map((rule) => rule.rule_id);
+        const currentRows = Array.isArray(filteredRules.value)
+          ? filteredRules.value
+          : rules.value;
+        const currentPageRuleIds = currentRows.map((rule) => rule.rule_id);
         const selectedIds = selection.map((rule) => rule.rule_id);
         const pageExcluded = currentPageRuleIds.filter(
           (id) => !selectedIds.includes(id),
@@ -1795,11 +2019,21 @@ export default {
           excludedRules.value = []; // 重置排除列表
 
           // 在全选模式下，所有规则都被选中（要删除），用户可以取消勾选要保留的规则
-          selectedRules.value = [...rules.value]; // 当前页面的规则
+          selectedRules.value = [...filteredRules.value]; // 当前页面的规则
 
           // 选中当前页面的所有规则
-          rules.value.forEach((rule) => {
-            rulesTableRef.value?.toggleRowSelection(rule, true);
+          nextTick(() => {
+            suppressSelectionChange.value = true;
+            rulesTableRef.value?.clearSelection();
+            const rows = Array.isArray(filteredRules.value)
+              ? filteredRules.value
+              : rules.value;
+            rows.forEach((rule) => {
+              rulesTableRef.value?.toggleRowSelection(rule, true);
+            });
+            nextTick(() => {
+              suppressSelectionChange.value = false;
+            });
           });
         }
       } catch (error) {
@@ -1837,7 +2071,6 @@ export default {
         } catch (error) {
           console.error("重新获取规则ID失败:", error);
         }
-
         // 全选模式：删除所有规则，除了排除列表中的规则
         ruleIdsToDelete = allSelectedRuleIds.value.filter(
           (id) =>
@@ -1913,9 +2146,29 @@ export default {
         submitting.value = true;
 
         try {
-          const patternList = ruleForm.patterns
+          const stringPatterns = ruleForm.patterns
+            .filter((p) => p.match_type !== "regex")
+            .filter((p) => p.content && p.content.trim());
+          const stringPatternContents = stringPatterns.map((p) => p.content);
+          const contentOptions = stringPatterns.map((p) => {
+            const opt = {};
+            const offset = Number(p.offset);
+            const depth = Number(p.depth);
+            const within = Number(p.within);
+            const distance = Number(p.distance);
+            if (Number.isFinite(offset) && offset >= 0) opt.offset = offset;
+            if (Number.isFinite(depth) && depth >= 0) opt.depth = depth;
+            if (Number.isFinite(within) && within >= 0) opt.within = within;
+            if (Number.isFinite(distance) && distance >= 0)
+              opt.distance = distance;
+            if (p.nocase) opt.nocase = true;
+            return opt;
+          });
+          const regexPatterns = ruleForm.patterns
+            .filter((p) => p.match_type === "regex")
             .map((p) => p.content)
             .filter((content) => content && content.trim());
+          const allPatterns = [...stringPatternContents, ...regexPatterns];
           const byteTests = [];
           const byteTestErrors = [];
 
@@ -1964,13 +2217,28 @@ export default {
             }
           }
 
-          if (patternList.length === 0 && byteTests.length === 0) {
+          if (allPatterns.length === 0 && byteTests.length === 0) {
             ElMessage.error("至少需要一个匹配内容或一个 byte_test 条件");
             submitting.value = false;
             return;
           }
 
-          const byteTestOnly = patternList.length === 0 && byteTests.length > 0;
+          const byteTestOnly = allPatterns.length === 0 && byteTests.length > 0;
+
+          let patternType = "string";
+          let patternValue = stringPatternContents;
+
+          if (!byteTestOnly) {
+            if (regexPatterns.length > 0) {
+              patternType = "pcre";
+              patternValue = regexPatterns;
+            } else if (ruleForm.nocase && stringPatternContents.length > 0) {
+              patternType = "pcre";
+              patternValue = stringPatternContents.map(
+                (p) => `(?i)${escapeRegex(p)}`,
+              );
+            }
+          }
 
           // 转换表单数据
           const ruleData = {
@@ -1991,14 +2259,10 @@ export default {
                 ? null
                 : parsePorts(ruleForm.dst_ports_str),
             direction: ruleForm.direction || "->",
-            pattern: byteTestOnly ? "__BYTE_TEST_ONLY__" : patternList,
-            pattern_type: byteTestOnly
-              ? "snort_byte_test"
-              : ruleForm.patterns[0]?.match_type === "regex"
-                ? "pcre"
-                : "string",
+            pattern: byteTestOnly ? "__BYTE_TEST_ONLY__" : patternValue,
+            pattern_type: byteTestOnly ? "snort_byte_test" : patternType,
             description: ruleForm.name,
-            tags: [],
+            tags: parseTags(ruleForm.tags_str),
             metadata: {
               snort_sid: ruleForm.rule_id,
               snort_rev: ruleForm.rev,
@@ -2008,6 +2272,15 @@ export default {
               flags: ruleForm.flags || undefined,
               ip_id: ruleForm.ip_id,
               ip_proto: ruleForm.ip_proto,
+              nocase: !!ruleForm.nocase,
+              content_patterns: stringPatternContents.length
+                ? stringPatternContents
+                : undefined,
+              content_options: contentOptions.some(
+                (o) => o && Object.keys(o).length > 0,
+              )
+                ? contentOptions
+                : undefined,
               byte_tests: byteTests,
               byte_test_only: byteTestOnly,
             },
@@ -2059,6 +2332,11 @@ export default {
       ruleForm.patterns.push({
         content: "",
         match_type: "string",
+        offset: null,
+        depth: null,
+        distance: null,
+        within: null,
+        nocase: false,
       });
     };
 
@@ -2119,6 +2397,7 @@ export default {
         protocol: null,
         classtype: "",
         rev: null,
+        tags_str: "",
         src: "any",
         dst: "any",
         src_ports_str: "any",
@@ -2130,6 +2409,11 @@ export default {
           {
             content: "",
             match_type: "string",
+            offset: null,
+            depth: null,
+            distance: null,
+            within: null,
+            nocase: false,
           },
         ],
         byte_test_enabled: false,
@@ -2149,6 +2433,7 @@ export default {
         flags: "",
         ip_id: null,
         ip_proto: null,
+        nocase: false,
       });
       isEditing.value = false;
       if (ruleFormRef.value) {
@@ -2408,24 +2693,6 @@ export default {
       currentPage.value = 1; // 筛选时重置到第一页
       loadRules();
     };
-
-    // 监听页面变化，在全选模式下保持用户的选择状态
-    watch(currentPage, () => {
-      if (selectAllMode.value) {
-        // 延迟执行，确保数据已加载
-        nextTick(() => {
-          // 在全选模式下，默认所有规则都被选中，除非在排除列表中
-          rules.value.forEach((rule) => {
-            const shouldSelect = !excludedRules.value.includes(rule.rule_id);
-            rulesTableRef.value?.toggleRowSelection(rule, shouldSelect);
-          });
-          // 更新selectedRules为当前页面被选中的规则
-          selectedRules.value = rules.value.filter(
-            (rule) => !excludedRules.value.includes(rule.rule_id),
-          );
-        });
-      }
-    });
 
     onMounted(() => {
       loadRules();
@@ -3031,7 +3298,7 @@ export default {
 }
 
 .content-match-alert .el-alert__description {
-  font-size: 14px;
+  font-size: 12px;
   line-height: 1.5;
   color: #606266;
 }

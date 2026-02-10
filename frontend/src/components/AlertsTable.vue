@@ -9,7 +9,7 @@
           class="toolbar-select rule-select"
         >
           <el-option
-            v-for="r in rules"
+            v-for="r in ruleOptions"
             :key="r.rule_id"
             :label="r.rule_id + (r.name ? ' · ' + r.name : '')"
             :value="r.rule_id"
@@ -405,6 +405,19 @@ export default {
       link.click();
     }
 
+    const ruleOptions = computed(() => {
+      const seen = new Set();
+      const out = [];
+      (alerts.value || []).forEach((a) => {
+        const rid = normalizeRuleId(getRuleId(a));
+        if (!rid || seen.has(rid)) return;
+        seen.add(rid);
+        const r = ruleMap[rid] || ruleMap[rid.toLowerCase()];
+        out.push({ rule_id: rid, name: r ? r.name : "" });
+      });
+      return out;
+    });
+
     async function deleteAlertById(id) {
       try {
         const res = await fetch(`/api/alerts/${id}`, { method: "DELETE" });
@@ -590,6 +603,7 @@ export default {
     return {
       alerts,
       rules,
+      ruleOptions,
       ruleMap,
       detailVisible,
       detailRow,
@@ -654,8 +668,8 @@ export default {
   min-width: 140px;
 }
 .toolbar-select.rule-select {
-  width: 280px;
-  min-width: 200px;
+  width: 200px;
+  min-width: 160px;
 }
 .toolbar-input {
   width: 160px;
