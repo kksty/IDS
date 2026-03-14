@@ -71,7 +71,7 @@
           <el-card shadow="never" class="info-card">
             <div class="card-title">网络与抓包</div>
             <div class="kv-row">
-              <span class="kv-label">监听地址</span>
+              <span class="kv-label">后端地址</span>
               <span class="kv-value"
                 >{{ config.host || "-" }}:{{ config.port || "-" }}</span
               >

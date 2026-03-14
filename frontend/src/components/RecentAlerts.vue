@@ -501,7 +501,7 @@ export default {
   left: 12px;
   right: 12px;
   bottom: 12px;
-  z-index: 9999;
+  z-index: 12000; /* 确保全屏时不会被顶部导航遮挡，方便点击切换回窗口模式 */
   margin: 0;
   border-radius: 8px;
 }

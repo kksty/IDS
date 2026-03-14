@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 协议解析器模块
-为不同协议提供专门的解析功能，包括SSH、FTP、DNS等
-使用pypcapkit作为主要解析器，结合自定义解析器
+为 DNS、SMTP、POP3、HTTP 提供解析，用于 Snort sticky buffer 规则。
 """
 import re
 import logging
@@ -13,7 +12,7 @@ logger = logging.getLogger("ids.protocol_parser")
 
 # 尝试导入pypcapkit解析器
 try:
-    from pcapkit.protocols.application import HTTP as PcapHTTP, FTP as PcapFTP
+    from pcapkit.protocols.application import HTTP as PcapHTTP
     _HAVE_PCAPKIT_APP = True
 except ImportError:
     _HAVE_PCAPKIT_APP = False
@@ -36,14 +35,10 @@ class ProtocolParser:
 
     def __init__(self):
         self.parsers = {
-            'ssh': self._parse_ssh,
-            'ftp': self._parse_ftp_pypcapkit if _HAVE_PCAPKIT_APP else self._parse_ftp,
             'dns': self._parse_dns,
             'smtp': self._parse_smtp,
             'pop3': self._parse_pop3,
-            'imap': self._parse_imap,
-            'telnet': self._parse_telnet,
-            'http': self._parse_http_pypcapkit if _HAVE_PCAPKIT_APP else self._parse_http_fallback,  # Use pypcapkit with improved error handling
+            'http': self._parse_http_pypcapkit if _HAVE_PCAPKIT_APP else self._parse_http_fallback,
         }
 
     def parse_packet(self, src_ip: str, dst_ip: str, src_port: int, dst_port: int,
@@ -91,43 +86,27 @@ class ProtocolParser:
         """检测协议类型"""
         # 只对TCP和UDP进行基于payload的检测，ICMP不进行应用层协议检测
         if protocol not in ('TCP', 'UDP'):
-            # 只进行基于端口的检测
             port_protocols = {
-                22: 'ssh',
-                21: 'ftp',
-                20: 'ftp',  # FTP数据端口
                 53: 'dns',
                 25: 'smtp',
-                587: 'smtp',  # SMTP提交
-                465: 'smtp',  # SMTPS
+                587: 'smtp',
+                465: 'smtp',
                 110: 'pop3',
-                995: 'pop3',  # POP3S
-                143: 'imap',
-                993: 'imap',  # IMAPS
-                23: 'telnet',
+                995: 'pop3',
             }
             for port in [src_port, dst_port]:
                 if port in port_protocols:
                     return port_protocols[port]
             return None
 
-        # 基于端口的检测
         port_protocols = {
-            22: 'ssh',
-            21: 'ftp',
-            20: 'ftp',  # FTP数据端口
             53: 'dns',
             25: 'smtp',
-            587: 'smtp',  # SMTP提交
-            465: 'smtp',  # SMTPS
+            587: 'smtp',
+            465: 'smtp',
             110: 'pop3',
-            995: 'pop3',  # POP3S
-            143: 'imap',
-            993: 'imap',  # IMAPS
-            23: 'telnet',
+            995: 'pop3',
         }
-
-        # 检查源端口和目的端口
         for port in [src_port, dst_port]:
             if port in port_protocols:
                 return port_protocols[port]
@@ -135,21 +114,10 @@ class ProtocolParser:
         # 基于payload的检测（只对TCP/UDP）
         if len(payload) > 0:
             payload_str = payload[:50].decode('utf-8', errors='ignore').lower()
-
-            # HTTP检测
             if payload_str.startswith(('get ', 'post ', 'put ', 'delete ', 'head ', 'options ', 'patch ')) or \
                'http/' in payload_str[:100]:
                 return 'http'
-
-            # SSH检测
-            if payload.startswith(b'SSH-') or b'ssh' in payload[:20].lower():
-                return 'ssh'
-
-            # FTP检测
-            if any(cmd in payload_str for cmd in ['user ', 'pass ', 'retr ', 'stor ', 'list ']):
-                return 'ftp'
-
-            # DNS检测（简化）
+            # DNS
             if len(payload) >= 12:
                 # DNS查询的标志位检查
                 flags = payload[2:4]
@@ -157,76 +125,6 @@ class ProtocolParser:
                     return 'dns'
 
         return None
-
-    def _parse_ssh(self, payload: bytes, src_port: int, dst_port: int) -> Dict[str, Any]:
-        """解析SSH协议"""
-        data = {
-            'type': 'unknown',
-            'version': None,
-            'commands': [],
-            'errors': []
-        }
-
-        try:
-            payload_str = payload.decode('utf-8', errors='ignore')
-
-            # SSH版本识别
-            if payload_str.startswith('SSH-'):
-                lines = payload_str.split('\n')
-                if lines:
-                    data['version'] = lines[0].strip()
-
-            # 简单的命令检测（实际SSH是加密的，这里只是基本检测）
-            if b'password' in payload.lower():
-                data['type'] = 'authentication'
-            elif any(cmd in payload_str.lower() for cmd in ['exec', 'shell', 'subsystem']):
-                data['type'] = 'command'
-            else:
-                data['type'] = 'handshake'
-
-        except Exception as e:
-            data['errors'].append(str(e))
-
-        return data
-
-    def _parse_ftp_pypcapkit(self, payload: bytes, src_port: int, dst_port: int) -> Dict[str, Any]:
-        """使用pypcapkit解析FTP协议"""
-        data = {
-            'type': 'unknown',
-            'command': None,
-            'args': None,
-            'response_code': None,
-            'response_text': None,
-            'errors': []
-        }
-
-        try:
-            ftp_parser = PcapFTP(payload)
-            info = ftp_parser.info
-
-            # 解析FTP信息
-            if hasattr(info, 'type'):
-                data['type'] = info.type
-
-            if hasattr(info, 'cmmd'):
-                data['command'] = info.cmmd
-
-            if hasattr(info, 'args'):
-                data['args'] = info.args
-
-            # 如果是响应
-            if hasattr(info, 'code'):
-                data['response_code'] = info.code
-
-            if hasattr(info, 'text'):
-                data['response_text'] = info.text
-
-        except Exception as e:
-            data['errors'].append(f"pypcapkit FTP parsing failed: {e}")
-            # 回退到自定义解析
-            return self._parse_ftp(payload, src_port, dst_port)
-
-        return data
 
     def _parse_http_pypcapkit(self, payload: bytes, src_port: int, dst_port: int) -> Dict[str, Any]:
         """使用pypcapkit解析HTTP协议"""
@@ -353,39 +251,6 @@ class ProtocolParser:
 
         return data
 
-    def _parse_ftp(self, payload: bytes, src_port: int, dst_port: int) -> Dict[str, Any]:
-        """解析FTP协议"""
-        data = {
-            'commands': [],
-            'responses': [],
-            'files': [],
-            'errors': []
-        }
-
-        try:
-            payload_str = payload.decode('utf-8', errors='ignore')
-            lines = payload_str.split('\n')
-
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-
-                # FTP命令
-                if re.match(r'^[A-Z]{3,4}\s', line.upper()):
-                    data['commands'].append(line)
-                # FTP响应
-                elif re.match(r'^\d{3}\s', line):
-                    data['responses'].append(line)
-                # 文件名检测
-                elif any(keyword in line.lower() for keyword in ['filename', 'file=', 'name=']):
-                    data['files'].append(line)
-
-        except Exception as e:
-            data['errors'].append(str(e))
-
-        return data
-
     def _parse_dns(self, payload: bytes, src_port: int, dst_port: int) -> Dict[str, Any]:
         """解析DNS协议"""
         data = {
@@ -501,70 +366,6 @@ class ProtocolParser:
                 # POP3响应
                 elif line.startswith('+OK') or line.startswith('-ERR'):
                     data['responses'].append(line)
-
-        except Exception as e:
-            data['errors'].append(str(e))
-
-        return data
-
-    def _parse_imap(self, payload: bytes, src_port: int, dst_port: int) -> Dict[str, Any]:
-        """解析IMAP协议"""
-        data = {
-            'commands': [],
-            'responses': [],
-            'errors': []
-        }
-
-        try:
-            payload_str = payload.decode('utf-8', errors='ignore')
-            lines = payload_str.split('\n')
-
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-
-                # IMAP命令
-                if re.match(r'^\w+\s+(LOGIN|SELECT|EXAMINE|CREATE|DELETE|RENAME|SUBSCRIBE|UNSUBSCRIBE|LIST|LSUB|STATUS|APPEND|CHECK|CLOSE|EXPUNGE|SEARCH|FETCH|STORE|COPY|UID)', line.upper()):
-                    data['commands'].append(line)
-                # IMAP响应
-                elif line.startswith('* ') or re.match(r'^\w+\s+(OK|NO|BAD)', line.upper()):
-                    data['responses'].append(line)
-
-        except Exception as e:
-            data['errors'].append(str(e))
-
-        return data
-
-    def _parse_telnet(self, payload: bytes, src_port: int, dst_port: int) -> Dict[str, Any]:
-        """解析Telnet协议"""
-        data = {
-            'commands': [],
-            'negotiations': [],
-            'data': None,
-            'errors': []
-        }
-
-        try:
-            # Telnet协议有特殊的命令序列（IAC）
-            if len(payload) > 0:
-                iac_positions = []
-                i = 0
-                while i < len(payload) - 1:
-                    if payload[i] == 255:  # IAC
-                        iac_positions.append(i)
-                        i += 2  # 跳过IAC和命令
-                    else:
-                        i += 1
-
-                data['negotiations'] = len(iac_positions)
-
-                # 提取非控制数据
-                if iac_positions:
-                    # 简单的数据提取（实际Telnet解析更复杂）
-                    data['data'] = payload.decode('utf-8', errors='ignore').strip()
-                else:
-                    data['data'] = payload.decode('utf-8', errors='ignore').strip()
 
         except Exception as e:
             data['errors'].append(str(e))

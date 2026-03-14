@@ -7,17 +7,34 @@
           <span class="dot" :class="wsStatusClass"></span>
           <span class="ws-text">实时通道：{{ wsStatusText }}</span>
         </div>
+        <div class="user-status">
+          <span v-if="currentUser">
+            当前用户：{{ currentUser.username }}（{{ currentUser.role }}）
+          </span>
+          <span v-else>当前未登录</span>
+        </div>
       </div>
       <nav class="nav-actions">
-        <a
-          v-for="item in navItems"
-          :key="item.id"
-          :href="'#/' + item.id"
-          class="nav-link"
-          :class="{ active: page === item.id }"
+        <template v-for="item in navItems" :key="item.id">
+          <a
+            v-if="item.id !== 'users' || (currentUser && currentUser.role === 'admin')"
+            :href="'#/' + item.id"
+            class="nav-link"
+            :class="{ active: page === item.id }"
+          >
+            {{ item.label }}
+          </a>
+        </template>
+        <button
+          v-if="!isAuthenticated"
+          class="nav-btn"
+          @click="navigate('login')"
         >
-          {{ item.label }}
-        </a>
+          登录
+        </button>
+        <button v-else class="nav-btn nav-btn-logout" @click="logout">
+          退出
+        </button>
       </nav>
     </header>
     <main
@@ -25,7 +42,7 @@
       :class="{ 'full-width': page === 'alerts' || page === 'rules' }"
     >
       <section class="main-left">
-        <alert-counter v-if="page !== 'stats'" />
+        <alert-counter v-if="page !== 'stats' && page !== 'rule-guide'" />
         <div v-if="page === 'home'" class="page-content">
           <recent-alerts />
         </div>
@@ -50,6 +67,18 @@
         <div v-else-if="page === 'system'" class="page-content">
           <system-status />
         </div>
+        <div v-else-if="page === 'login'" class="page-content">
+          <login-page />
+        </div>
+        <div
+          v-else-if="page === 'rule-guide'"
+          class="page-content page-content-wide"
+        >
+          <rule-guide />
+        </div>
+        <div v-else-if="page === 'users'" class="page-content">
+          <users-page />
+        </div>
       </section>
       <aside class="main-right">
         <traffic-chart />
@@ -68,6 +97,9 @@ import StatsPage from "./components/StatsPage.vue";
 import SuspectedAttackers from "./components/SuspectedAttackers.vue";
 import TrafficChart from "./components/TrafficChart.vue";
 import SystemStatus from "./components/SystemStatus.vue";
+import LoginPage from "./components/LoginPage.vue";
+import RuleGuide from "./components/RuleGuide.vue";
+import UsersPage from "./components/UsersPage.vue";
 import bus from "./ws";
 
 export default {
@@ -80,10 +112,18 @@ export default {
     SuspectedAttackers,
     TrafficChart,
     SystemStatus,
+    LoginPage,
+    RuleGuide,
+    UsersPage,
   },
   setup() {
     const page = ref("home");
     const wsStatus = ref("connecting"); // open / closed / error / connecting
+    const apiBase = "";
+    const token = ref(localStorage.getItem("ids_token") || "");
+    const currentUser = ref(null);
+
+    const isAuthenticated = computed(() => !!token.value);
 
     function setPageFromHash() {
       const h = (window.location.hash || "").replace(/^#\/?/, "");
@@ -95,7 +135,10 @@ export default {
         h === "stats" ||
         h === "correlation" ||
         h === "system" ||
-        h === "home"
+        h === "login" ||
+        h === "home" ||
+        h === "rule-guide" ||
+        h === "users"
       ) {
         page.value = h;
       } else {
@@ -106,6 +149,36 @@ export default {
 
     function navigate(p) {
       window.location.hash = `#/${p}`;
+    }
+
+    async function fetchCurrentUser() {
+      if (!token.value) {
+        currentUser.value = null;
+        return;
+      }
+      try {
+        const resp = await fetch(`${apiBase}/api/auth/me`, {
+          headers: {
+            Authorization: `Bearer ${token.value}`,
+          },
+        });
+        if (resp.ok) {
+          currentUser.value = await resp.json();
+        } else {
+          currentUser.value = null;
+          token.value = "";
+          localStorage.removeItem("ids_token");
+        }
+      } catch (e) {
+        console.error("获取当前用户失败:", e);
+      }
+    }
+
+    function logout() {
+      token.value = "";
+      currentUser.value = null;
+      localStorage.removeItem("ids_token");
+      window.location.hash = "#/login";
     }
 
     function onHashChange() {
@@ -148,6 +221,7 @@ export default {
       { id: "stats", label: "数据统计" },
       { id: "correlation", label: "关联分析" },
       { id: "system", label: "系统状态" },
+      { id: "users", label: "用户管理" },
     ];
 
     onMounted(() => {
@@ -182,6 +256,8 @@ export default {
       // 保存引用以便 cleanup
       window.__handleHashChange = handleHashChange;
       window.__handleWsStatus = handleWsStatus;
+
+      fetchCurrentUser();
     });
 
     onBeforeUnmount(() => {
@@ -196,7 +272,16 @@ export default {
       }
     });
 
-    return { page, navigate, wsStatusText, wsStatusClass, navItems };
+    return {
+      page,
+      navigate,
+      wsStatusText,
+      wsStatusClass,
+      navItems,
+      isAuthenticated,
+      currentUser,
+      logout,
+    };
   },
 };
 </script>
@@ -245,6 +330,10 @@ body {
   flex-direction: column;
   gap: 6px;
 }
+.user-status {
+  font-size: 13px;
+  color: #4b5563;
+}
 .ws-status {
   display: flex;
   align-items: center;
@@ -273,6 +362,30 @@ body {
   align-items: center;
   gap: 4px;
   flex-wrap: wrap;
+}
+
+.nav-btn {
+  margin-left: 8px;
+  padding: 6px 12px;
+  border-radius: 6px;
+  border: 1px solid #d1d5db;
+  background: #f9fafb;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.nav-btn:hover {
+  background: #e5e7eb;
+}
+
+.nav-btn-logout {
+  border-color: #f97373;
+  color: #b91c1c;
+  background: #fef2f2;
+}
+
+.nav-btn-logout:hover {
+  background: #fee2e2;
 }
 .nav-link {
   padding: 8px 14px;

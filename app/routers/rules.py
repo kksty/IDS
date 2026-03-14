@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-from fastapi import APIRouter, HTTPException, UploadFile, File
+from fastapi import APIRouter, HTTPException, UploadFile, File, Depends
 from typing import List, Any
 from sqlalchemy.exc import SQLAlchemyError
 import json
@@ -7,6 +7,7 @@ import logging
 
 from app.models import Rule
 from app.services import engine as engine_mgr
+from app.routers.auth import get_current_active_user, require_admin, User
 
 from app.db import SessionLocal
 from app.models.db_models import RuleModel
@@ -43,7 +44,12 @@ def _parse_pattern(pattern_str: str, pattern_type: str = "string") -> Any:
 
 
 @router.get("/ids")
-async def get_rule_ids(search: str = "", category: str = "", tags: str = ""):
+async def get_rule_ids(
+    search: str = "",
+    category: str = "",
+    tags: str = "",
+    current_user: User = Depends(get_current_active_user),
+):
     """获取符合条件的规则ID列表，用于批量操作"""
     session = SessionLocal()
     try:
@@ -77,7 +83,14 @@ async def get_rule_ids(search: str = "", category: str = "", tags: str = ""):
 
 
 @router.get("/")
-async def get_rules(skip: int = 0, limit: int = 20, search: str = "", category: str = "", tags: str = ""):
+async def get_rules(
+    skip: int = 0,
+    limit: int = 20,
+    search: str = "",
+    category: str = "",
+    tags: str = "",
+    current_user: User = Depends(get_current_active_user),
+):
     """获取规则列表，支持分页、搜索和筛选"""
     session = SessionLocal()
     try:
@@ -147,7 +160,10 @@ async def get_rules(skip: int = 0, limit: int = 20, search: str = "", category: 
 
 
 @router.post("/", response_model=Rule)
-async def create_rule(rule: Rule):
+async def create_rule(
+    rule: Rule,
+    current_user: User = Depends(require_admin),
+):
     session = SessionLocal()
     try:
         exists = session.query(RuleModel).filter(RuleModel.rule_id == rule.rule_id).first()
@@ -191,7 +207,10 @@ async def create_rule(rule: Rule):
         session.close()
 
 @router.delete("/batch")
-async def batch_delete_rules(rule_ids: List[str]):
+async def batch_delete_rules(
+    rule_ids: List[str],
+    current_user: User = Depends(require_admin),
+):
     """批量删除规则"""
     if not rule_ids:
         raise HTTPException(status_code=400, detail="规则ID列表不能为空")
@@ -232,7 +251,10 @@ async def batch_delete_rules(rule_ids: List[str]):
         session.close()
 
 @router.delete("/{rule_id}")
-async def delete_rule(rule_id: str):
+async def delete_rule(
+    rule_id: str,
+    current_user: User = Depends(require_admin),
+):
     session = SessionLocal()
     try:
         row = session.query(RuleModel).filter(RuleModel.rule_id == rule_id).first()
@@ -250,7 +272,11 @@ async def delete_rule(rule_id: str):
 
 
 @router.put("/{rule_id}", response_model=Rule)
-async def update_rule(rule_id: str, rule: Rule):
+async def update_rule(
+    rule_id: str,
+    rule: Rule,
+    current_user: User = Depends(require_admin),
+):
     """更新已有规则（按 rule_id），替换存储并触发引擎重建。"""
     session = SessionLocal()
     try:
@@ -299,7 +325,10 @@ async def update_rule(rule_id: str, rule: Rule):
 
 
 @router.post("/bulk-import")
-async def bulk_import_rules(file: UploadFile = File(...)):
+async def bulk_import_rules(
+    file: UploadFile = File(...),
+    current_user: User = Depends(require_admin),
+):
     """
     批量导入Snort3规则文件
     支持上传.rules文件，自动解析并转换为系统规则格式
@@ -312,9 +341,16 @@ async def bulk_import_rules(file: UploadFile = File(...)):
         content = await file.read()
         rules_text = content.decode('utf-8')
 
-        # 导入Snort3规则
+        # 导入Snort3规则并保存到数据库
         from app.services.snort_importer import bulk_import_snort_rules
         import_result = bulk_import_snort_rules(rules_text)
+
+        # 导入成功后重新从数据库加载规则并重建引擎，
+        # 确保新导入的 Snort 规则立即参与匹配，而无需重启服务。
+        try:
+            engine_mgr.load_rules_from_db()
+        except Exception as e:
+            logger.exception("Failed to reload rules after Snort import: %s", e)
 
         # 构建详细的响应消息
         success_count = import_result["imported"]

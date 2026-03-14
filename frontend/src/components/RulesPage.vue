@@ -56,6 +56,9 @@
           <el-button type="info" class="action-btn" @click="loadRules">
             <el-icon><Refresh /></el-icon><span>刷新</span>
           </el-button>
+          <el-button type="warning" class="action-btn" @click="showRuleGuide">
+            <el-icon><Document /></el-icon><span>规则说明</span>
+          </el-button>
         </div>
       </div>
     </div>
@@ -394,7 +397,8 @@
                     <li>
                       <strong>flow：</strong
                       >会话方向/状态过滤（to_client/to_server/from_client/from_server
-                      + established/stateless）
+                      + established/stateless）。
+                      <em>仅对 TCP 全量实现；UDP 为已知限制，flow 条件可能放行。</em>
                     </li>
                     <li>
                       <strong>isdataat：</strong
@@ -468,6 +472,15 @@
 
           <el-row :gutter="20">
             <el-col :span="12">
+              <el-form-item label="优先级">
+                <el-select v-model="ruleForm.priority" placeholder="1=高 2=中 3=低">
+                  <el-option label="1 - 高" :value="1" />
+                  <el-option label="2 - 中" :value="2" />
+                  <el-option label="3 - 低" :value="3" />
+                </el-select>
+              </el-form-item>
+            </el-col>
+            <el-col :span="12">
               <el-form-item label="rev">
                 <el-input
                   v-model.number="ruleForm.rev"
@@ -476,6 +489,9 @@
                 />
               </el-form-item>
             </el-col>
+          </el-row>
+
+          <el-row :gutter="20">
             <el-col :span="12">
               <el-form-item label="启用状态">
                 <el-switch v-model="ruleForm.enabled" />
@@ -663,40 +679,76 @@
               </el-row>
 
               <el-row :gutter="20" v-if="pattern.match_type !== 'regex'">
-                <el-col :span="6">
+                <el-col :span="7">
                   <el-form-item label="offset" class="pattern-form-item">
                     <el-input
                       v-model.number="pattern.offset"
                       type="number"
                       placeholder="可选"
-                    />
+                    >
+                      <template #suffix>
+                        <el-tooltip
+                          content="从数据包的哪个位置开始搜索匹配内容。0表示从开头开始，正数表示跳过指定字节。"
+                          placement="top"
+                        >
+                          <el-icon class="info-icon"><InfoFilled /></el-icon>
+                        </el-tooltip>
+                      </template>
+                    </el-input>
                   </el-form-item>
                 </el-col>
-                <el-col :span="6">
+                <el-col :span="7">
                   <el-form-item label="depth" class="pattern-form-item">
                     <el-input
                       v-model.number="pattern.depth"
                       type="number"
                       placeholder="可选"
-                    />
+                    >
+                      <template #suffix>
+                        <el-tooltip
+                          content="从offset位置开始，搜索的最大深度范围。限制匹配内容搜索的长度。"
+                          placement="top"
+                        >
+                          <el-icon class="info-icon"><InfoFilled /></el-icon>
+                        </el-tooltip>
+                      </template>
+                    </el-input>
                   </el-form-item>
                 </el-col>
-                <el-col :span="6">
+                <el-col :span="7">
                   <el-form-item label="distance" class="pattern-form-item">
                     <el-input
                       v-model.number="pattern.distance"
                       type="number"
                       placeholder="可选"
-                    />
+                    >
+                      <template #suffix>
+                        <el-tooltip
+                          content="与前一个匹配条件之间的最小距离。指定在前一个匹配后至少跳过多少字节再开始当前匹配。"
+                          placement="top"
+                        >
+                          <el-icon class="info-icon"><InfoFilled /></el-icon>
+                        </el-tooltip>
+                      </template>
+                    </el-input>
                   </el-form-item>
                 </el-col>
-                <el-col :span="6">
+                <el-col :span="7">
                   <el-form-item label="within" class="pattern-form-item">
                     <el-input
                       v-model.number="pattern.within"
                       type="number"
                       placeholder="可选"
-                    />
+                    >
+                      <template #suffix>
+                        <el-tooltip
+                          content="在前一个匹配条件之后，多大范围内必须找到当前匹配。限制当前匹配相对于前一个匹配的最大距离。"
+                          placement="top"
+                        >
+                          <el-icon class="info-icon"><InfoFilled /></el-icon>
+                        </el-tooltip>
+                      </template>
+                    </el-input>
                   </el-form-item>
                 </el-col>
               </el-row>
@@ -875,7 +927,7 @@
                 >
                   <template #suffix>
                     <el-tooltip
-                      content="方向: to_client/to_server/from_client/from_server；状态: established/not_established/stateless；流: only_stream/no_stream"
+                      content="数据包方向: to_client/to_server/from_client/from_server；会话状态: established/not_established/stateless；流: only_stream/no_stream。注意：flow 仅对 TCP 全量实现，UDP 为已知限制。"
                       placement="top"
                     >
                       <el-icon class="info-icon"><InfoFilled /></el-icon>
@@ -1264,6 +1316,7 @@ import {
   Delete,
   Check,
   InfoFilled,
+  Document,
 } from "@element-plus/icons-vue";
 
 export default {
@@ -1291,6 +1344,14 @@ export default {
     const filterTags = ref("");
 
     const apiBase = ""; // 相对路径，由代理处理
+
+    // 简单的前端会话状态（基于本地存储的 JWT）
+    const token = ref(localStorage.getItem("ids_token") || "");
+    const currentUser = ref(null);
+    const isAuthenticated = computed(() => !!token.value);
+    const isAdmin = computed(
+      () => currentUser.value && currentUser.value.role === "admin",
+    );
 
     // 计算属性：过滤后的规则列表
     const filteredRules = computed(() => {
@@ -1336,6 +1397,7 @@ export default {
       action: "alert",
       protocol: null,
       classtype: "",
+      priority: 3,
       rev: null,
       tags_str: "",
       src: "any",
@@ -1410,9 +1472,13 @@ export default {
       content: [{ required: true, message: "请输入匹配内容", trigger: "blur" }],
     };
 
-    const uploadHeaders = computed(() => ({
-      // 如果需要认证，可以在这里添加
-    }));
+    const uploadHeaders = computed(() => {
+      const headers = {};
+      if (token.value) {
+        headers.Authorization = `Bearer ${token.value}`;
+      }
+      return headers;
+    });
 
     // 计算要删除的规则数量
     const rulesToDeleteCount = computed(() => {
@@ -1703,6 +1769,30 @@ export default {
       return issues;
     };
 
+    const fetchCurrentUser = async () => {
+      if (!token.value) {
+        currentUser.value = null;
+        return;
+      }
+      try {
+        const response = await fetch(`${apiBase}/api/auth/me`, {
+          headers: {
+            Authorization: `Bearer ${token.value}`,
+          },
+        });
+        if (response.ok) {
+          currentUser.value = await response.json();
+        } else {
+          // token 失效
+          token.value = "";
+          localStorage.removeItem("ids_token");
+          currentUser.value = null;
+        }
+      } catch (e) {
+        console.error("获取当前用户失败:", e);
+      }
+    };
+
     const loadRules = async () => {
       loading.value = true;
       try {
@@ -1714,7 +1804,11 @@ export default {
           category: filterCategory.value,
           tags: filterTags.value,
         });
-        const response = await fetch(`${apiBase}/api/rules/?${params}`);
+        const response = await fetch(`${apiBase}/api/rules/?${params}`, {
+          headers: token.value
+            ? { Authorization: `Bearer ${token.value}` }
+            : {},
+        });
         if (response.ok) {
           const data = await response.json();
           // Element Plus 在 data 替换时可能会触发 selection-change([])
@@ -1759,11 +1853,17 @@ export default {
     };
 
     const toggleRule = async (rule) => {
+      if (!isAdmin.value) {
+        ElMessage.error("只读用户不可修改规则状态");
+        rule.enabled = !rule.enabled;
+        return;
+      }
       try {
         const response = await fetch(`${apiBase}/api/rules/${rule.rule_id}`, {
           method: "PUT",
           headers: {
             "Content-Type": "application/json",
+            ...(token.value ? { Authorization: `Bearer ${token.value}` } : {}),
           },
           body: JSON.stringify(rule),
         });
@@ -1795,6 +1895,7 @@ export default {
         action: rule.action || "alert",
         protocol: rule.protocol,
         classtype: metadata.classtype || "",
+        priority: rule.priority ?? priorityFromClasstype(metadata.classtype),
         rev: metadata.snort_rev || metadata.rev || null,
         tags_str: Array.isArray(rule.tags) ? rule.tags.join(",") : "",
         src: rule.src,
@@ -1860,8 +1961,11 @@ export default {
             ? [rule.pattern]
             : [];
         const contentPatterns = metadata.content_patterns || [];
+        const displayPatterns = Array.isArray(rule.pattern) && rule.pattern.length >= contentPatterns.length
+          ? rule.pattern.slice(0, contentPatterns.length)
+          : contentPatterns;
         ruleForm.patterns = [
-          ...contentPatterns.map((content, idx) => {
+          ...displayPatterns.map((content, idx) => {
             const opt =
               idx < contentOptions.length && contentOptions[idx]
                 ? contentOptions[idx]
@@ -1887,14 +1991,17 @@ export default {
           })),
         ];
       } else if (Array.isArray(metadata.content_patterns)) {
-        const contentPatterns = metadata.content_patterns || [];
-        ruleForm.patterns = contentPatterns.map((content, idx) => {
+        // 使用 rule.pattern（原始 Snort 格式，如 |00 01|text|）而非 content_patterns（已归一化为字节，会显示乱码）
+        const displayPatterns = Array.isArray(rule.pattern) && rule.pattern.length === metadata.content_patterns.length
+          ? rule.pattern
+          : metadata.content_patterns;
+        ruleForm.patterns = displayPatterns.map((content, idx) => {
           const opt =
             idx < contentOptions.length && contentOptions[idx]
               ? contentOptions[idx]
               : {};
           return {
-            content,
+            content: content,
             match_type: "string",
             offset: opt.offset ?? null,
             depth: opt.depth ?? null,
@@ -1946,6 +2053,10 @@ export default {
     };
 
     const deleteRule = async (rule) => {
+      if (!isAdmin.value) {
+        ElMessage.error("只读用户不可删除规则");
+        return;
+      }
       try {
         await ElMessageBox.confirm(
           `确定要删除规则 "${rule.name}" 吗？此操作不可恢复。`,
@@ -1959,6 +2070,9 @@ export default {
 
         const response = await fetch(`${apiBase}/api/rules/${rule.rule_id}`, {
           method: "DELETE",
+          headers: token.value
+            ? { Authorization: `Bearer ${token.value}` }
+            : {},
         });
 
         if (response.ok) {
@@ -2011,7 +2125,11 @@ export default {
           category: filterCategory.value,
           tags: filterTags.value,
         });
-        const response = await fetch(`${apiBase}/api/rules/ids?${params}`);
+        const response = await fetch(`${apiBase}/api/rules/ids?${params}`, {
+          headers: token.value
+            ? { Authorization: `Bearer ${token.value}` }
+            : {},
+        });
         if (response.ok) {
           const allIds = await response.json();
           allSelectedRuleIds.value = allIds;
@@ -2246,7 +2364,7 @@ export default {
             name: ruleForm.name,
             action: "alert",
             protocol: ruleForm.protocol,
-            priority: priorityFromClasstype(ruleForm.classtype),
+            priority: ruleForm.priority,
             category: ruleForm.classtype || "custom",
             src: ruleForm.src,
             dst: ruleForm.dst,
@@ -2267,6 +2385,7 @@ export default {
               snort_sid: ruleForm.rule_id,
               snort_rev: ruleForm.rev,
               classtype: ruleForm.classtype || undefined,
+              priority: ruleForm.priority,
               flow: ruleForm.flow,
               isdataat: isdataatParsed.list,
               flags: ruleForm.flags || undefined,
@@ -2297,6 +2416,7 @@ export default {
             method,
             headers: {
               "Content-Type": "application/json",
+              ...uploadHeaders.value,
             },
             body: JSON.stringify(ruleData),
           });
@@ -2396,6 +2516,7 @@ export default {
         action: "alert",
         protocol: null,
         classtype: "",
+        priority: 3,
         rev: null,
         tags_str: "",
         src: "any",
@@ -2694,6 +2815,11 @@ export default {
       loadRules();
     };
 
+    const showRuleGuide = () => {
+      // 导航到规则说明书页面
+      window.location.hash = "#/rule-guide";
+    };
+
     onMounted(() => {
       loadRules();
     });
@@ -2770,6 +2896,7 @@ export default {
       filteredRules,
       handleSearch,
       handleFilter,
+      showRuleGuide,
       apiBase,
     };
   },

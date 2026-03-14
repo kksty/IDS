@@ -542,7 +542,7 @@ class SnifferManager:
         sticky_buffers: dict[str, bytes] = {}
         try:
             app_proto = (packet_info.get("app_proto") or "").lower()
-            if app_proto in ("dns", "ftp", "smtp", "pop3") and proto in ("TCP", "UDP"):
+            if app_proto in ("dns", "smtp", "pop3") and proto in ("TCP", "UDP"):
                 try:
                     src_port_i = int(sport)
                 except Exception:
@@ -565,12 +565,6 @@ class SnifferManager:
                             parts.append(str(rtype))
                         if parts:
                             sticky_buffers["dns_query"] = ("\n".join(parts)).encode("utf-8", errors="ignore")
-                    elif (parsed.protocol or "").lower() == "ftp":
-                        cmds = pd.get("commands") or []
-                        if isinstance(cmds, list) and cmds:
-                            sticky_buffers["ftp_command"] = ("\n".join([str(x) for x in cmds if x is not None])).encode(
-                                "utf-8", errors="ignore"
-                            )
                     elif (parsed.protocol or "").lower() == "smtp":
                         cmds = pd.get("commands") or []
                         if isinstance(cmds, list) and cmds:

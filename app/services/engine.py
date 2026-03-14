@@ -215,8 +215,6 @@ def match_payload(payload: bytes, protocol: str = "", dst_port: Optional[str] = 
             md = meta.get("metadata") or {}
             if md.get("dns_query"):
                 return "dns_query"
-            if md.get("ftp_command"):
-                return "ftp_command"
             if md.get("smtp_command"):
                 return "smtp_command"
             if md.get("pop_command"):
@@ -636,9 +634,6 @@ def _match_advanced_filters(meta: Dict[str, Any], packet_info: Optional[Dict[str
     if metadata.get("dns_query"):
         if app_proto != "dns":
             return False
-    if metadata.get("ftp_command"):
-        if app_proto != "ftp":
-            return False
     if metadata.get("smtp_command"):
         if app_proto != "smtp":
             return False
@@ -737,9 +732,11 @@ def _match_advanced_filters(meta: Dict[str, Any], packet_info: Optional[Dict[str
             if stream_flag is True:
                 return False
 
+        # established/not_established: 仅当 flow_established 明确为 False 时判为不匹配；
+        # 为 None（如 UDP、或 flow 状态未计算）时放行，避免规则完全无法命中。
         if "stateless" not in flow_tokens:
             if "established" in flow_tokens:
-                if flow_established is not True:
+                if flow_established is False:
                     return False
             if "not_established" in flow_tokens:
                 if flow_established is True:

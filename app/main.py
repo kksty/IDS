@@ -16,6 +16,7 @@ from app.routers import metrics as metrics_router
 from app.routers import alerts as alerts_router
 from app.routers import correlation as correlation_router
 from app.routers import system as system_router
+from app.routers import auth as auth_router
 from app.services.system_manager import get_system_manager
 from app.config import config
 
@@ -91,8 +92,11 @@ async def lifespan(app: FastAPI):
         # 初始化数据库和规则引擎
         from app.db import init_db
         from app.services import engine as engine_mgr
+        from app.routers.auth import ensure_initial_admin
 
         init_db()
+        # 确保至少存在一个默认 admin 账号（admin/admin）
+        ensure_initial_admin()
         engine_mgr.load_rules_from_db()
 
         # 初始化系统管理器
@@ -163,6 +167,7 @@ app.add_middleware(
 )
 
 # 注册路由
+app.include_router(auth_router.router)
 app.include_router(rules.router)
 app.include_router(websocket.router)
 app.include_router(metrics_router.router)

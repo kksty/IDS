@@ -85,9 +85,10 @@
                 class="grid-line"
               />
               <text
-                :x="marginLeft - 12"
+                :x="marginLeft - 8"
                 :y="yScale(tick) + 4"
-                class="axis-label"
+                class="axis-label y-label"
+                text-anchor="end"
               >
                 {{ tick }}
               </text>
@@ -105,13 +106,16 @@
                 :fill="colorHigh"
                 class="data-point"
               />
+            </g>
+            <g v-for="i in xLabelIndices" :key="'xl-' + i">
               <text
-                v-if="i % Math.ceil(buckets.length / 10) === 0"
+                v-if="buckets[i]"
                 :x="xFor(i)"
-                :y="svgHeight - 10"
+                :y="svgHeight - 8"
                 class="axis-label x-label"
+                text-anchor="middle"
               >
-                {{ shortLabel(b.label) }}
+                {{ formatAxisLabel(buckets[i].label) }}
               </text>
             </g>
           </svg>
@@ -265,7 +269,12 @@ export default {
       return Math.max(...vals, 10);
     });
 
-    const svgWidth = computed(() => Math.max(800, buckets.value.length * 60));
+    const svgWidth = computed(() => {
+      const n = buckets.value.length;
+      if (n <= 0) return 700;
+      if (n <= 3) return 500;
+      return Math.min(1200, Math.max(600, n * 40));
+    });
 
     const yScale = (val) => {
       const chartArea = svgHeight - marginTop - marginBottom;
@@ -281,8 +290,17 @@ export default {
     };
 
     const yTicks = computed(() => {
-      const m = maxVal.value;
-      return [0, Math.floor(m * 0.5), m];
+      const m = Math.max(1, maxVal.value);
+      const step = m <= 5 ? 1 : m <= 20 ? 5 : m <= 50 ? 10 : Math.ceil(m / 5);
+      const top = Math.ceil(m / step) * step;
+      const ticks = [];
+      for (let v = 0; v <= top; v += step) {
+        ticks.push(v);
+      }
+      if (ticks.length > 6) {
+        return ticks.filter((_, i) => i % 2 === 0);
+      }
+      return ticks.length ? ticks : [0, 1];
     });
 
     const buildPath = (key) => {
@@ -307,11 +325,18 @@ export default {
       }
     });
 
+        const intervalByRange = computed(() => {
+      const r = range.value;
+      if (r === "1h") return "30m";
+      if (r === "24h") return "1h";
+      return "1d";
+    });
+
     const load = async () => {
       loading.value = true;
       try {
         const [sres, rres] = await Promise.all([
-          fetch(`/api/alerts/stats?range=${range.value}&interval=30m`),
+          fetch(`/api/alerts/stats?range=${range.value}&interval=${intervalByRange.value}`),
           fetch(`/api/rules/`),
         ]);
 
@@ -402,9 +427,7 @@ export default {
       tooltip.show = true;
       tooltip.x = xFor(idx);
       tooltip.y = yScale(Math.max(b.high, b.medium, b.low)) - 60;
-      tooltip.label = b.label.includes("T")
-        ? b.label.split("T")[1].substring(0, 5)
-        : b.label;
+      tooltip.label = formatAxisLabel(b.label);
       tooltip.high = b.high;
       tooltip.medium = b.medium;
       tooltip.low = b.low;
@@ -413,8 +436,35 @@ export default {
     const onSvgLeave = () => {
       tooltip.show = false;
     };
-    const shortLabel = (l) =>
-      l && l.includes("T") ? l.split("T")[1].substring(0, 5) : l;
+
+    const formatAxisLabel = (l) => {
+      if (!l || typeof l !== "string") return "";
+      const s = l.trim();
+      if (!s) return "";
+      if (s.includes("T")) {
+        const [datePart, timePart] = s.split("T");
+        const date = datePart || "";
+        const time = (timePart || "").substring(0, 5);
+        if (date && time) return `${date.slice(5)} ${time}`;
+        if (time) return time;
+        return date.slice(5) || s;
+      }
+      if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(5);
+      return s;
+    };
+
+    const xLabelIndices = computed(() => {
+      const n = buckets.value.length;
+      if (n <= 0) return [];
+      if (n <= 8) return Array.from({ length: n }, (_, i) => i);
+      const step = Math.ceil(n / 10);
+      const indices = [];
+      for (let i = 0; i < n; i += step) indices.push(i);
+      if (indices[indices.length - 1] !== n - 1 && n > 1) indices.push(n - 1);
+      return indices;
+    });
+
+    const shortLabel = (l) => formatAxisLabel(l);
     const reload = () => load();
     const exportCsv = () => {
       window.alert("CSV数据已准备。");
@@ -439,6 +489,7 @@ export default {
       yTicks,
       yScale,
       xFor,
+      xLabelIndices,
       pathHigh,
       pathMedium,
       pathLow,
@@ -447,6 +498,7 @@ export default {
       onSvgMouseMove,
       onSvgLeave,
       shortLabel,
+      formatAxisLabel,
       reload,
       exportCsv,
       marginLeft,
@@ -533,6 +585,10 @@ export default {
 .axis-label {
   font-size: 11px;
   fill: #909399;
+}
+.axis-label.x-label {
+  font-size: 10px;
+  fill: #606266;
 }
 .trend-line {
   fill: none;

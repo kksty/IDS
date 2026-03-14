@@ -1,19 +1,8 @@
 # -*- coding: utf-8 -*-
 """TCP reassembly utilities.
 
-目标：为上层（HTTP 解析/规则匹配）提供“尽可能连续”的 TCP 字节流片段。
+为上层（HTTP 解析/规则匹配）提供“尽可能连续”的 TCP 字节流片段。
 
-设计取舍（适配毕业设计/工程原型）：
-- 仅实现单向（src:sport -> dst:dport）维度的重组；反向流独立建 buffer。
-- 采用 best-effort：处理乱序与重传，但不实现完整 TCP 状态机（SYN/FIN/RST）。
-- 以 per-flow 的 next_expected_seq 为基准，只在连续时吐出数据，避免重复/乱序污染上层解析。
-- 提供超时清理和内存上限控制，避免长时间运行内存泄露。
-
-API:
-  manager = FlowReassemblerManager()
-  ready_bytes = manager.append("TCP", src, dst, seq, payload, sport, dport)
-
-若 ready_bytes 非空，代表从 next_expected_seq 起拼出的连续数据，可直接 feed 给 httptools 等流式解析器。
 """
 
 from __future__ import annotations

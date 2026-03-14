@@ -29,11 +29,11 @@ def test_detect_dns_by_port_and_parse_domain_and_type():
 
 
 def test_non_tcp_udp_only_port_detection():
-    # ICMP payload should not be treated as HTTP by payload; only port detection applies.
+    # ICMP payload: only port detection applies (no payload-based HTTP/SSH detection).
     payload = b"GET / HTTP/1.1\r\n\r\n"
-    parsed = parse_packet_for_protocol("1.1.1.1", "2.2.2.2", 123, 22, payload, "ICMP")
+    parsed = parse_packet_for_protocol("1.1.1.1", "8.8.8.8", 5353, 53, payload, "ICMP")
     assert parsed is not None
-    assert parsed.protocol == "ssh"
+    assert parsed.protocol == "dns"
 
 
 def test_unknown_protocol_returns_none():
